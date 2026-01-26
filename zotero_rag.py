@@ -6,7 +6,7 @@ import hashlib
 from typing import List, Dict, Tuple, Set, Optional
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import faiss
 from dataclasses import dataclass, field
 import pickle
@@ -134,7 +134,7 @@ class ZoteroRAG:
     def __init__(self, zotero_data_dir: str = None, model_name: str = "BAAI/bge-small-en-v1.5", 
                  collection_name: str = None, grobid_url: str = "http://localhost:8070", grobid_timeout: int = 180,
                  model_device: str = None, encode_batch_size: int = 8, tei_cache_dir: str = None,
-                 output_base_dir: str = "output"):
+                 output_base_dir: str = "output", reranker_model: str = "cross-encoder/mmarco-MiniLMv2-L12-H384-v1"):
         self.zotero_dir = self._find_zotero_dir(zotero_data_dir)
         self.storage_dir = os.path.join(self.zotero_dir, 'storage')
         self.db_path = os.path.join(self.zotero_dir, 'zotero.sqlite')
@@ -145,6 +145,8 @@ class ZoteroRAG:
         self.grobid_client = GrobidClient(grobid_server=self.grobid_url)
         self.device = model_device or ("mps" if torch.backends.mps.is_available() else "cpu")
         self.encode_batch_size = encode_batch_size
+        self.reranker_model_name = reranker_model
+        self.reranker = None  # Lazy load on first use
 
         # Persistent cache for TEI outputs keyed by PDF path+mtime
         base_cache = tei_cache_dir or os.path.join(output_base_dir, "tei_cache")
@@ -216,6 +218,16 @@ class ZoteroRAG:
             color_idx = len(self.query_color_map) % len(self.query_colors)
             self.query_color_map[query] = self.query_colors[color_idx]
         return self.query_color_map[query]
+    
+    def _load_reranker(self):
+        """Lazily load the cross-encoder reranker on first use."""
+        if self.reranker is None:
+            try:
+                self.reranker = CrossEncoder(self.reranker_model_name, device=self.device)
+            except Exception as e:
+                print(f"Warning: Could not load reranker {self.reranker_model_name}: {e}")
+                self.reranker = False  # Mark as failed to avoid retrying
+        return self.reranker if self.reranker else None
     
     def get_zotero_items(self) -> List[Dict]:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
@@ -637,10 +649,21 @@ class ZoteroRAG:
         
         return len(self.chunks)
 
-    def search(self, query: str, threshold: float = 1.2) -> List[Tuple[Chunk, float]]:
-        if not self.index: raise ValueError("Index is not built.")
+    def search(self, query: str, threshold: float = 1.2, use_reranker: bool = True) -> List[Tuple[Chunk, float]]:
+        """Search for relevant passages with optional cross-encoder reranking.
         
-        # Extract keywords from query
+        Args:
+            query: Question or search query
+            threshold: L2 distance threshold for initial retrieval (lower = more results)
+            use_reranker: Whether to rerank results with cross-encoder (better for Q&A)
+        
+        Returns:
+            List of (Chunk, score) tuples, sorted by score
+        """
+        if not self.index: 
+            raise ValueError("Index is not built.")
+        
+        # Stage 1: Retrieve with semantic search
         keywords = self._extract_keywords(query)
         
         query_embedding = self.model.encode([query])
@@ -656,7 +679,34 @@ class ZoteroRAG:
                 results.append((Chunk(chunk.text, chunk.pdf_path, chunk.page_num, chunk.item_key, 
                                      chunk.title, chunk.section, chunk.bbox, query, color), float(dist)))
         
-        results.sort(key=lambda x: x[1])
+        # Stage 2: Rerank with cross-encoder if requested
+        if use_reranker and results:
+            reranker = self._load_reranker()
+            if reranker:
+                try:
+                    # Create pairs: (query, passage_text)
+                    pairs = [[query, chunk.text] for chunk, _ in results]
+                    
+                    # Score with cross-encoder (higher = better match for the question)
+                    with torch.no_grad():
+                        scores = reranker.predict(pairs)
+                    
+                    # Re-sort by cross-encoder scores (descending, best first)
+                    results_with_ce_scores = list(zip(results, scores))
+                    results_with_ce_scores.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # Return chunks with cross-encoder scores
+                    results = [(chunk, float(score)) for (chunk, _), score in results_with_ce_scores]
+                except Exception as e:
+                    print(f"Warning: Reranking failed, returning semantic results: {e}")
+                    results.sort(key=lambda x: x[1])
+            else:
+                # Reranker not available, use semantic scores
+                results.sort(key=lambda x: x[1])
+        else:
+            # No reranking, sort by semantic distance
+            results.sort(key=lambda x: x[1])
+        
         return results
 
     def highlight_pdf(self, chunks_for_pdf: List[Chunk], output_path: str):
@@ -714,7 +764,17 @@ class ZoteroRAG:
                         annot = page.add_text_annot(areas[0].tl, f"Q: {chunk.query[:50]}...")
                         annot.update()
             
-            doc.save(output_path)
+            # Use incremental save if file already exists, otherwise normal save
+            # But fall back to non-incremental if encryption prevents incremental writes
+            incremental = os.path.exists(output_path) and source_pdf == output_path
+            try:
+                doc.save(output_path, incremental=incremental)
+            except RuntimeError as e:
+                if "encryption" in str(e).lower():
+                    # PDF has encryption, can't do incremental writes
+                    doc.save(output_path, incremental=False)
+                else:
+                    raise
             doc.close()
             return output_path
         except Exception as e:
