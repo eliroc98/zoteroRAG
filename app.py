@@ -9,7 +9,6 @@ import sys
 from typing import List, Dict, Tuple
 import subprocess
 import sqlite3
-from pathlib import Path
 import streamlit as st
 from zotero_rag import ZoteroRAG
 import re

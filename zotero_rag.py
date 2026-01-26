@@ -2,21 +2,19 @@ import os
 import sqlite3
 import re
 import threading
-import time
 import hashlib
 from typing import List, Dict, Tuple, Set, Optional
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 import faiss
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 import pickle
 import warnings
 import requests
 import tempfile
 import shutil
 import xml.etree.ElementTree as ET
-from nltk.tokenize import sent_tokenize
 import nltk
 from grobid_client.grobid_client import GrobidClient
 
