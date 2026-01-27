@@ -1,12 +1,17 @@
 import os
+# Suppress noisy progress bars that can trigger BrokenPipe in Streamlit
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import sqlite3
 import re
 import threading
 import hashlib
+import logging
 from typing import List, Dict, Tuple, Set, Optional
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer, pipeline
 import faiss
 from dataclasses import dataclass, field
 import pickle
@@ -20,6 +25,28 @@ from grobid_client.grobid_client import GrobidClient
 
 warnings.filterwarnings('ignore', message='.*position_ids.*')
 
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create formatters
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# File handler
+file_handler = logging.FileHandler('zotero_rag.log', mode='a')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+# Add handlers only if they haven't been added yet
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
 # Download NLTK data for sentence tokenization
 try:
     nltk.data.find('tokenizers/punkt')
@@ -27,23 +54,51 @@ except LookupError:
     nltk.download('punkt', quiet=True)
 
 @dataclass
-class Chunk:
+class Paragraph:
+    """Represents a paragraph-level chunk for QA."""
     text: str
     pdf_path: str
     page_num: int
     item_key: str
     title: str
     section: str = "body"  # section type: body, abstract, intro, etc.
-    bbox: Tuple[float, float, float, float] = None
-    query: str = ""
-    color: Tuple[float, float, float] = field(default_factory=lambda: (1, 1, 0))
+    sentence_count: int = 0  # number of sentences in this paragraph
+    sentences: List[Tuple[str, str]] = field(default_factory=list)  # List of (sentence_text, coords)
     
     def __reduce__(self):
         """Custom pickle support for dataclass."""
         return (
             self.__class__,
             (self.text, self.pdf_path, self.page_num, self.item_key, self.title, 
-             self.section, self.bbox, self.query, self.color)
+             self.section, self.sentence_count, self.sentences)
+        )
+
+
+@dataclass
+class Answer:
+    """Represents an extracted answer to a question."""
+    text: str  # The answer text extracted from passage
+    context: str  # Full paragraph context
+    pdf_path: str
+    page_num: int
+    item_key: str
+    title: str
+    section: str = "body"
+    start_char: int = 0  # Character position in context where answer starts
+    end_char: int = 0  # Character position in context where answer ends
+    score: float = 0.0  # QA model confidence score
+    query: str = ""
+    color: Tuple[float, float, float] = field(default_factory=lambda: (1, 1, 0))
+    sentence_coords: List[str] = field(default_factory=list)  # TEI coordinates for highlighting
+    retrieval_score: float = 0.0  # Semantic search distance/score
+    
+    def __reduce__(self):
+        """Custom pickle support for dataclass."""
+        return (
+            self.__class__,
+            (self.text, self.context, self.pdf_path, self.page_num, self.item_key, self.title,
+             self.section, self.start_char, self.end_char, self.score, self.query, self.color, 
+             self.sentence_coords, self.retrieval_score)
         )
 
 
@@ -131,22 +186,23 @@ class ZoteroRAG:
         conn.close()
         return collections
     
-    def __init__(self, zotero_data_dir: str = None, model_name: str = "BAAI/bge-small-en-v1.5", 
+    def __init__(self, zotero_data_dir: str = None, model_name: str = "BAAI/bge-base-en-v1.5", 
                  collection_name: str = None, grobid_url: str = "http://localhost:8070", grobid_timeout: int = 180,
                  model_device: str = None, encode_batch_size: int = 8, tei_cache_dir: str = None,
-                 output_base_dir: str = "output", reranker_model: str = "cross-encoder/mmarco-MiniLMv2-L12-H384-v1"):
+                 output_base_dir: str = "output", qa_model: str = "deepset/roberta-base-squad2"):
         self.zotero_dir = self._find_zotero_dir(zotero_data_dir)
         self.storage_dir = os.path.join(self.zotero_dir, 'storage')
         self.db_path = os.path.join(self.zotero_dir, 'zotero.sqlite')
         self.collection_name = collection_name
         self.model_name = model_name
+        self.qa_model_name = qa_model
         self.grobid_url = grobid_url
         self.grobid_timeout = grobid_timeout
         self.grobid_client = GrobidClient(grobid_server=self.grobid_url)
         self.device = model_device or ("mps" if torch.backends.mps.is_available() else "cpu")
         self.encode_batch_size = encode_batch_size
-        self.reranker_model_name = reranker_model
-        self.reranker = None  # Lazy load on first use
+        self.qa_pipeline = None  # Lazy load on first use
+        self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=self.device)
 
         # Persistent cache for TEI outputs keyed by PDF path+mtime
         base_cache = tei_cache_dir or os.path.join(output_base_dir, "tei_cache")
@@ -156,7 +212,7 @@ class ZoteroRAG:
 
         self.model = SentenceTransformer(model_name, device=self.device)
         
-        self.chunks: List[Chunk] = []
+        self.paragraphs: List[Paragraph] = []
         self.index = None
         
         # Base directory for all indexes
@@ -211,7 +267,7 @@ class ZoteroRAG:
             self.index_path = f"{full_base_path}.index"
             self.chunks_path = f"{full_base_path}.pkl"
             
-        print(f"Index paths set to: {self.index_path} and {self.chunks_path}")
+        logger.info(f"Index paths set to: {self.index_path} and {self.chunks_path}")
 
     def get_query_color(self, query: str) -> Tuple[float, float, float]:
         if query not in self.query_color_map:
@@ -219,15 +275,21 @@ class ZoteroRAG:
             self.query_color_map[query] = self.query_colors[color_idx]
         return self.query_color_map[query]
     
-    def _load_reranker(self):
-        """Lazily load the cross-encoder reranker on first use."""
-        if self.reranker is None:
+    def _load_qa_pipeline(self):
+        """Lazily load the QA pipeline on first use."""
+        if self.qa_pipeline is None:
             try:
-                self.reranker = CrossEncoder(self.reranker_model_name, device=self.device)
+                # Use transformers pipeline with the QA model
+                self.qa_pipeline = pipeline(
+                    'question-answering',
+                    model=self.qa_model_name,
+                    tokenizer=self.qa_model_name,
+                    device=0 if self.device == "cuda" else -1
+                )
             except Exception as e:
-                print(f"Warning: Could not load reranker {self.reranker_model_name}: {e}")
-                self.reranker = False  # Mark as failed to avoid retrying
-        return self.reranker if self.reranker else None
+                logger.warning(f"Could not load QA model {self.qa_model_name}: {e}")
+                self.qa_pipeline = False  # Mark as failed to avoid retrying
+        return self.qa_pipeline if self.qa_pipeline else None
     
     def get_zotero_items(self) -> List[Dict]:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
@@ -320,7 +382,7 @@ class ZoteroRAG:
         """Parse a single PDF using grobid-client-python and return TEI XML root."""
         try:
             if not self.grobid_is_alive():
-                print(f"GROBID not reachable at {self.grobid_url}")
+                logger.error(f"GROBID not reachable at {self.grobid_url}")
                 return None
 
             # Cache check: use pdf path + mtime to build stable key
@@ -369,32 +431,74 @@ class ZoteroRAG:
                             pass
                         return ET.fromstring(content)
                     else:
-                        print(f"GROBID client did not produce TEI for {pdf_path}")
+                        logger.warning(f"GROBID client did not produce TEI for {pdf_path}")
                         return None
                 finally:
                     shutil.rmtree(in_dir, ignore_errors=True)
                     shutil.rmtree(out_dir, ignore_errors=True)
         except Exception as e:
-            print(f"Error parsing PDF with GROBID: {e}")
+            logger.error(f"Error parsing PDF with GROBID: {e}")
             return None
     
-    def extract_sentences_from_tei(self, tei_root: ET.Element, pdf_path: str, item_title: str) -> List[Tuple[str, int, str]]:
+    def extract_paragraphs_from_tei(self, tei_root: ET.Element, pdf_path: str, item_title: str) -> List[Tuple[str, int, str, List[Tuple[str, str]]]]:
         """
-        Extract sentences from TEI XML structure.
-        Returns list of (sentence_text, page_number, section_type) tuples.
+        Extract paragraphs from TEI XML structure where each <p> is a paragraph.
+        Returns list of (paragraph_text, page_number, section_type, sentences) tuples.
+        sentences is a list of (sentence_text, coords) tuples.
         """
-        sentences = []
+        paragraphs = []
         
         # Define TEI namespace
         ns = {'tei': 'http://www.tei-c.org/ns/1.0'}
         
+        # Extract from abstract (each <p> is a paragraph)
+        abstract = tei_root.find('.//tei:abstract', ns)
+        if abstract is not None:
+            # Iterate over <p> (paragraphs)
+            for p_elem in abstract.findall('.//tei:p', ns):
+                sentences_with_coords = []
+                page_num = 0
+                
+                # Iterate over <s> (sentences) within this paragraph
+                for s in p_elem.findall('.//tei:s', ns):
+                    # Extract text from sentence
+                    text_parts = []
+                    for elem in s.iter():
+                        if elem.text:
+                            text_parts.append(elem.text)
+                        if elem.tail:
+                            text_parts.append(elem.tail)
+                    
+                    sentence_text = ''.join(text_parts).strip()
+                    # Use coords from <s> element
+                    coords = s.get('coords', '')
+                    
+                    if sentence_text:
+                        sentences_with_coords.append((sentence_text, coords))
+                    
+                    # Try to extract page number from first sentence's coords
+                    if page_num == 0 and coords:
+                        try:
+                            parts = coords.split(';')
+                            if parts:
+                                page_info = parts[0]
+                                page_num = int(page_info.split(',')[0]) - 1
+                        except:
+                            pass
+                
+                # Join all sentences to form this paragraph
+                if sentences_with_coords:
+                    paragraph_text = ' '.join([sent for sent, _ in sentences_with_coords])
+                    if len(paragraph_text.split()) >= 10:
+                        paragraphs.append((paragraph_text, page_num, 'abstract', sentences_with_coords))
+        
         # Extract from body (main content)
         body = tei_root.find('.//tei:body', ns)
         if body is not None:
-            # Process all div elements (sections)
-            for div in body.findall('.//tei:div', ns):
+            # Process all top-level div elements (sections)
+            for section_div in body.findall('tei:div', ns):
                 # Determine section type from head element
-                head = div.find('tei:head', ns)
+                head = section_div.find('tei:head', ns)
                 section_type = 'body'
                 if head is not None and head.text:
                     head_text = head.text.lower()
@@ -411,9 +515,13 @@ class ZoteroRAG:
                     elif 'conclusion' in head_text:
                         section_type = 'conclusion'
                 
-                # Extract sentences from paragraphs
-                for p in div.findall('tei:p', ns):
-                    for s in p.findall('tei:s', ns):
+                # Iterate over <p> (paragraphs) within this section
+                for p_elem in section_div.findall('.//tei:p', ns):
+                    sentences_with_coords = []
+                    page_num = 0
+                    
+                    # Iterate over <s> (sentences) within this paragraph
+                    for s in p_elem.findall('.//tei:s', ns):
                         # Extract text from sentence
                         text_parts = []
                         for elem in s.iter():
@@ -423,65 +531,102 @@ class ZoteroRAG:
                                 text_parts.append(elem.tail)
                         
                         sentence_text = ''.join(text_parts).strip()
+                        # Use coords from <s> element
+                        coords = s.get('coords', '')
                         
-                        # Skip very short sentences and non-content
-                        if len(sentence_text.split()) >= 3:
-                            # Try to extract page number from coords if available
-                            page_num = 0
-                            coords = s.get('coords')
-                            if coords:
-                                try:
-                                    # coords format: "page_x,page_y,page_width,page_height"
-                                    parts = coords.split(';')
-                                    if parts:
-                                        page_info = parts[0]
-                                        page_num = int(page_info.split(',')[0]) - 1  # Convert to 0-indexed
-                                except:
-                                    pass
-                            
-                            sentences.append((sentence_text, page_num, section_type))
+                        if sentence_text:
+                            sentences_with_coords.append((sentence_text, coords))
+                        
+                        # Try to extract page number from first sentence's coords
+                        if page_num == 0 and coords:
+                            try:
+                                parts = coords.split(';')
+                                if parts:
+                                    page_info = parts[0]
+                                    page_num = int(page_info.split(',')[0]) - 1
+                            except:
+                                pass
+                    
+                    # Join all sentences from this <p> into one paragraph
+                    if sentences_with_coords:
+                        paragraph_text = ' '.join([sent for sent, _ in sentences_with_coords])
+                        # Skip very short paragraphs
+                        if len(paragraph_text.split()) >= 10:
+                            paragraphs.append((paragraph_text, page_num, section_type, sentences_with_coords))
         
-        return sentences
+        return paragraphs
     
-    def extract_text_chunks(self, pdf_path: str, item_title: str, chunk_size: int = None) -> List[Tuple[str, int, Tuple, str]]:
+    def extract_text_chunks(self, pdf_path: str, item_title: str, chunk_size: int = None) -> List[Tuple[str, int, str]]:
         """
-        Extract text chunks (sentences) from PDF using GROBID.
-        Returns list of (sentence_text, page_number, bbox, section_type) tuples.
+        Extract paragraphs from PDF using GROBID.
+        Returns list of (paragraph_text, page_number, section_type) tuples.
         """
-        chunks = []
-        
-        
         tei_root = self.parse_pdf_with_grobid(pdf_path)
         if tei_root is None:
-            print(f"GROBID parsing failed for {pdf_path}; no chunks extracted")
+            logger.warning(f"GROBID parsing failed for {pdf_path}; no paragraphs extracted")
             return []
 
-        sentences = self.extract_sentences_from_tei(tei_root, pdf_path, item_title)
-        for sentence_text, page_num, section_type in sentences:
-            chunks.append((sentence_text, page_num, None, section_type))
-        return chunks
+        paragraphs = self.extract_paragraphs_from_tei(tei_root, pdf_path, item_title)
+        return paragraphs
+    
+    def _expand_to_sentences(self, paragraph: Paragraph, start_char: int, end_char: int) -> Tuple[str, int, int, List[str]]:
+        """Expand answer span to include complete sentences and return their coordinates.
         
-    def _extract_keywords(self, query: str) -> Set[str]:
-        """Extract meaningful keywords from query (simple approach)."""
-        # Remove common stop words
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-                     'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
-                     'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-                     'would', 'could', 'should', 'may', 'might', 'can', 'about', 'what',
-                     'which', 'who', 'when', 'where', 'why', 'how'}
-        
-        # Extract words, convert to lowercase, remove punctuation
-        words = re.findall(r'\b\w+\b', query.lower())
-        keywords = {w for w in words if w not in stop_words and len(w) > 2}
-        return keywords
+        Args:
+            paragraph: The Paragraph object containing the answer
+            start_char: Start position of answer in context
+            end_char: End position of answer in context
+            
+        Returns:
+            (expanded_text, new_start, new_end, sentence_coords) tuple
+        """
+        if not paragraph.sentences:
+            return paragraph.text[start_char:end_char], start_char, end_char, []
 
-    def _chunk_contains_keywords(self, chunk_text: str, keywords: Set[str]) -> bool:
-        """Check if chunk contains at least one keyword from the query."""
-        if not keywords:
-            return True  # If no keywords extracted, don't filter
+        # Map character positions to sentences
+        # We need to find which sentence(s) the answer span falls into
         
-        chunk_lower = chunk_text.lower()
-        return any(keyword in chunk_lower for keyword in keywords)
+        start_sentence_idx = -1
+        end_sentence_idx = -1
+        
+        current_pos = 0
+        for i, (sent_text, _) in enumerate(paragraph.sentences):
+            # Calculate range for this sentence including trailing space
+            sent_len = len(sent_text)
+            sent_start = current_pos
+            sent_end = current_pos + sent_len
+            
+            # Check if answer start falls in this sentence
+            if start_sentence_idx == -1 and start_char < sent_end + 1: # +1 for the space we add when joining
+                start_sentence_idx = i
+            
+            # Check if answer end falls in this sentence
+            if end_char <= sent_end + 1: # +1 for the space
+                end_sentence_idx = i
+                break
+                
+            current_pos += sent_len + 1 # +1 for space between sentences
+            
+        if start_sentence_idx == -1:
+            start_sentence_idx = 0
+        if end_sentence_idx == -1:
+            end_sentence_idx = len(paragraph.sentences) - 1
+            
+        # Extract full text of all involved sentences
+        involved_sentences = paragraph.sentences[start_sentence_idx : end_sentence_idx + 1]
+        
+        expanded_text = " ".join(s[0] for s in involved_sentences)
+        sentence_coords = [s[1] for s in involved_sentences if s[1]]
+        
+        # Calculate new start/end relative to the whole paragraph text
+        # (This is an approximation since we reconstruct paragraph text from sentences)
+        new_start = 0
+        for i in range(start_sentence_idx):
+            new_start += len(paragraph.sentences[i][0]) + 1
+            
+        new_end = new_start + len(expanded_text)
+        
+        return expanded_text, new_start, new_end, sentence_coords
 
     def index_exists(self) -> bool:
         """Check if the index and chunks files exist for the current collection."""
@@ -497,26 +642,25 @@ class ZoteroRAG:
         try:
             self.index = faiss.read_index(self.index_path)
             with open(self.chunks_path, 'rb') as f:
-                chunks_data = pickle.load(f)
+                paragraphs_data = pickle.load(f)
         except (EOFError, pickle.UnpicklingError) as e:
             raise ValueError(f"Corrupted index files detected. Please rebuild the index. Error: {e}")
         
-        # Convert back to Chunk objects
-        self.chunks = [
-            Chunk(
+        # Convert back to Paragraph objects
+        self.paragraphs = [
+            Paragraph(
                 text=item['text'],
                 pdf_path=item['pdf_path'],
                 page_num=item['page_num'],
                 item_key=item['item_key'],
                 title=item['title'],
                 section=item.get('section', 'body'),
-                bbox=item.get('bbox'),
-                query=item.get('query', ''),
-                color=tuple(item.get('color', (1, 1, 0)))
+                sentence_count=item.get('sentence_count', 0),
+                sentences=item.get('sentences', [])
             )
-            for item in chunks_data
+            for item in paragraphs_data
         ]
-        return len(self.chunks)
+        return len(self.paragraphs)
 
     def build_index(self, force_rebuild: bool = False, progress_callback=None):
         """Build or load the FAISS index from Zotero PDFs.
@@ -539,7 +683,7 @@ class ZoteroRAG:
             except ValueError as e:
                 if "Corrupted" in str(e):
                     # Index is corrupted, rebuild it
-                    print(f"Detected corrupted index, rebuilding: {e}")
+                    logger.warning(f"Detected corrupted index, rebuilding: {e}")
                     force_rebuild = True
                 else:
                     raise
@@ -548,21 +692,22 @@ class ZoteroRAG:
         if not items:
             raise ValueError("No PDF items found in the specified Zotero collection/library.")
         
-        self.chunks = []
+        self.paragraphs = []
         all_texts = []
         
-        # Stage 1: Process PDFs
+        # Stage 1: Process PDFs and extract paragraphs
         for idx, item in enumerate(items):
             if progress_callback:
                 progress_callback('pdf', idx, len(items), f"Processing: {item['title'][:50]}...")
             
-            text_chunks = self.extract_text_chunks(item['path'], item['title'])
-            for text, page_num, bbox, section in text_chunks:
+            paragraph_tuples = self.extract_text_chunks(item['path'], item['title'])
+            for text, page_num, section, sentences in paragraph_tuples:
                 # Filter by section type if needed
                 if not self.CONTENT_SECTIONS.get(section, True):
                     continue
-                chunk = Chunk(text, item['path'], page_num, item['key'], item['title'], section, bbox)
-                self.chunks.append(chunk)
+                sentence_count = len(sentences)
+                paragraph = Paragraph(text, item['path'], page_num, item['key'], item['title'], section, sentence_count, sentences)
+                self.paragraphs.append(paragraph)
                 all_texts.append(text)
         
         if not all_texts:
@@ -629,154 +774,291 @@ class ZoteroRAG:
         os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
         
         faiss.write_index(self.index, self.index_path)
-        # Save chunks as serializable format
-        chunks_data = [
+        # Save paragraphs as serializable format
+        paragraphs_data = [
             {
-                'text': chunk.text,
-                'pdf_path': chunk.pdf_path,
-                'page_num': chunk.page_num,
-                'item_key': chunk.item_key,
-                'title': chunk.title,
-                'section': chunk.section,
-                'bbox': chunk.bbox,
-                'query': chunk.query,
-                'color': chunk.color
+                'text': para.text,
+                'pdf_path': para.pdf_path,
+                'page_num': para.page_num,
+                'item_key': para.item_key,
+                'title': para.title,
+                'section': para.section,
+                'sentence_count': para.sentence_count,
+                'sentences': para.sentences
             }
-            for chunk in self.chunks
+            for para in self.paragraphs
         ]
         with open(self.chunks_path, 'wb') as f:
-            pickle.dump(chunks_data, f)
+            pickle.dump(paragraphs_data, f)
         
-        return len(self.chunks)
+        return len(self.paragraphs)
 
-    def search(self, query: str, threshold: float = 1.2, use_reranker: bool = True) -> List[Tuple[Chunk, float]]:
-        """Search for relevant passages with optional cross-encoder reranking.
+    def answer_question(self, question: str, retrieval_threshold: float = 2.0, qa_score_threshold: float = 0.0, progress_callback=None) -> List[Answer]:
+        """Answer a question using QA pipeline.
+        
+        Pipeline:
+        1. Retrieve relevant paragraphs (semantic search)
+        2. Rank paragraphs by similarity score (lower L2 distance = better)
+        3. Extract answers (QA model)
+        4. Filter by QA confidence threshold
         
         Args:
-            query: Question or search query
-            threshold: L2 distance threshold for initial retrieval (lower = more results)
-            use_reranker: Whether to rerank results with cross-encoder (better for Q&A)
+            question: The question to answer
+            retrieval_threshold: FAISS L2 distance threshold (higher = more candidates)
+            qa_score_threshold: Minimum QA confidence score to return (default 0.0)
+                               Only answers with score >= threshold will be returned
+            progress_callback: Function that accepts (current, total, message)
         
         Returns:
-            List of (Chunk, score) tuples, sorted by score
+            List of Answer objects sorted by confidence (highest first)
         """
         if not self.index: 
             raise ValueError("Index is not built.")
         
-        # Stage 1: Retrieve with semantic search
-        keywords = self._extract_keywords(query)
+        # Stage 1: Retrieve candidate paragraphs with semantic search
         
-        query_embedding = self.model.encode([query])
-        lims, D, I = self.index.range_search(np.array(query_embedding).astype('float32'), threshold)
+        query_embedding = self.model.encode([question], show_progress_bar=False)
+        lims, D, I = self.index.range_search(np.array(query_embedding).astype('float32'), retrieval_threshold)
         indices, distances = I[lims[0]:lims[1]], D[lims[0]:lims[1]]
-        results = []
-        color = self.get_query_color(query)
+        
+        logger.debug(f"Question: {question}")
+        logger.debug(f"Retrieved {len(indices)} paragraphs within L2 distance {retrieval_threshold}")
+        
+        candidate_paragraphs = []
+        color = self.get_query_color(question)
+        debug_candidates = []
         
         for idx, dist in zip(indices, distances):
-            chunk = self.chunks[idx]
-            # Filter by keyword presence
-            if self._chunk_contains_keywords(chunk.text, keywords):
-                results.append((Chunk(chunk.text, chunk.pdf_path, chunk.page_num, chunk.item_key, 
-                                     chunk.title, chunk.section, chunk.bbox, query, color), float(dist)))
+            paragraph = self.paragraphs[idx]
+            # No keyword filtering
+            candidate_paragraphs.append((paragraph, float(dist)))
+            debug_candidates.append({
+                'paragraph': paragraph,
+                'retrieval_score': float(dist),
+                'kept': True
+            })
         
-        # Stage 2: Rerank with cross-encoder if requested
-        if use_reranker and results:
-            reranker = self._load_reranker()
-            if reranker:
-                try:
-                    # Create pairs: (query, passage_text)
-                    pairs = [[query, chunk.text] for chunk, _ in results]
-                    
-                    # Score with cross-encoder (higher = better match for the question)
-                    with torch.no_grad():
-                        scores = reranker.predict(pairs)
-                    
-                    # Re-sort by cross-encoder scores (descending, best first)
-                    results_with_ce_scores = list(zip(results, scores))
-                    results_with_ce_scores.sort(key=lambda x: x[1], reverse=True)
-                    
-                    # Return chunks with cross-encoder scores
-                    results = [(chunk, float(score)) for (chunk, _), score in results_with_ce_scores]
-                except Exception as e:
-                    print(f"Warning: Reranking failed, returning semantic results: {e}")
-                    results.sort(key=lambda x: x[1])
-            else:
-                # Reranker not available, use semantic scores
-                results.sort(key=lambda x: x[1])
-        else:
-            # No reranking, sort by semantic distance
-            results.sort(key=lambda x: x[1])
+        logger.debug(f"{len(candidate_paragraphs)} paragraphs passed keyword filter")
         
-        return results
+        if not candidate_paragraphs:
+            self.last_candidates = []
+            return []
+        
+        pairs = [[question, p[0].text] for p in candidate_paragraphs]
+        scores = self.reranker.predict(pairs)
+        candidate_paragraphs = [x for _, x in sorted(zip(scores, candidate_paragraphs), key=lambda pair: pair[0], reverse=True)]
+        logger.debug(f"Sorted {len(candidate_paragraphs)} paragraphs by retrieval score")
+        
+        # Save debug candidates for UI inspection
+        self.last_candidates = [
+            {
+                'paragraph': d['paragraph'],
+                'retrieval_score': d['retrieval_score'],
+                'kept': d['kept'],
+            }
+            for d in debug_candidates
+        ]
 
-    def highlight_pdf(self, chunks_for_pdf: List[Chunk], output_path: str):
-        """Highlight PDF by finding and marking sentences with query match. Preserves previous highlights."""
-        if not chunks_for_pdf: 
+        # Stage 3: Extract answers with QA model
+        qa_pipe = self._load_qa_pipeline()
+        
+        answers = []
+        
+        if qa_pipe:
+            logger.debug(f"QA model available, extracting answers from {len(candidate_paragraphs)} paragraphs")
+            try:
+                for i, (paragraph, retrieval_score) in enumerate(candidate_paragraphs):
+                    # Update progress for each paragraph processed
+                    if progress_callback:
+                        progress_callback(i, len(candidate_paragraphs), f"Analyzing paragraph {i+1}/{len(candidate_paragraphs)}")
+                    
+                    # Build QA input
+                    QA_input = {
+                        'question': question,
+                        'context': paragraph.text
+                    }
+                    
+                    # Get answer from QA model
+                    result = qa_pipe(**QA_input)
+                    
+                    if result:
+                        # Expand answer to include full sentence(s) and get coordinates
+                        if len(result['answer'].split()) < 3: 
+                            continue 
+                        raw_answer = result['answer']
+                        raw_start = result.get('start', 0)
+                        raw_end = result.get('end', len(raw_answer))
+                        
+                        expanded_text, new_start, new_end, sentence_coords = self._expand_to_sentences(
+                            paragraph, raw_start, raw_end
+                        )
+                        
+                        logger.debug(f"Answer {i+1}: '{expanded_text}' (score: {result.get('score', 0.0):.4f})")
+                        logger.debug(f"  Original: '{raw_answer}'")
+                        logger.debug(f"  Sentence coords: {len(sentence_coords)} sentences")
+                        
+                        answer = Answer(
+                            text=expanded_text,
+                            context=paragraph.text,
+                            pdf_path=paragraph.pdf_path,
+                            page_num=paragraph.page_num,
+                            item_key=paragraph.item_key,
+                            title=paragraph.title,
+                            section=paragraph.section,
+                            start_char=new_start,
+                            end_char=new_end,
+                            score=float(result.get('score', 0.0)),
+                            query=question,
+                            color=color,
+                            sentence_coords=sentence_coords,
+                            retrieval_score=retrieval_score
+                        )
+                        answers.append(answer)
+                    else:
+                        logger.debug(f"Answer {i+1}: No answer extracted")
+                
+                # Final progress update
+                if progress_callback:
+                    progress_callback(len(candidate_paragraphs), len(candidate_paragraphs), "Finalizing results...")
+                    
+            except Exception as e:
+                logger.error(f"QA extraction failed: {e}", exc_info=True)
+                # If QA pipeline fails, abort so the caller can handle it
+                raise RuntimeError("QA extraction failed; aborting without fallback paragraphs")
+        else:
+            # QA model not available: abort instead of returning paragraphs
+            raise RuntimeError("QA pipeline not available; cannot answer question")
+        
+        logger.debug(f"Total answers extracted: {len(answers)}")
+        
+        # Sort by QA confidence score (descending)
+        answers.sort(key=lambda x: x.score, reverse=True)
+        
+        # Filter by QA score threshold
+        filtered_answers = [a for a in answers if a.score >= qa_score_threshold]
+        
+        logger.debug(f"Answers passing QA threshold {qa_score_threshold}: {len(filtered_answers)}")
+        
+        return filtered_answers
+
+    def highlight_pdf(self, answers_for_pdf: List[Answer], output_path: str):
+        """Highlight PDF using TEI sentence coordinates for precise highlighting."""
+        if not answers_for_pdf: 
             return None
         
         try:
             import fitz
         except ImportError:
-            print("PyMuPDF (fitz) not available for highlighting")
+            logger.warning("PyMuPDF (fitz) not available for highlighting")
             return None
         
         try:
             # Use previously highlighted PDF if it exists (to preserve previous highlights),
             # otherwise use original PDF
-            source_pdf = output_path if os.path.exists(output_path) else chunks_for_pdf[0].pdf_path
+            source_pdf = output_path if os.path.exists(output_path) else answers_for_pdf[0].pdf_path
             doc = fitz.open(source_pdf)
-            chunks_by_page = {}
-            for chunk in chunks_for_pdf:
-                chunks_by_page.setdefault(chunk.page_num, []).append(chunk)
+            answers_by_page = {}
+            for answer in answers_for_pdf:
+                answers_by_page.setdefault(answer.page_num, []).append(answer)
             
-            for page_num, chunks in chunks_by_page.items():
+            for page_num, answers in answers_by_page.items():
                 page = doc[page_num]
-                for chunk in chunks:
-                    # Search for the sentence in the PDF
-                    # Try full sentence first, then progressively shorter versions
-                    search_text = chunk.text
-                    areas = []
-                    
-                    # Try increasingly shorter versions of the text
-                    for attempt in range(3):
-                        if attempt == 0:
-                            search_text = chunk.text[:100]
-                        elif attempt == 1:
-                            search_text = " ".join(chunk.text.split()[:10])
-                        else:
-                            search_text = " ".join(chunk.text.split()[:5])
+                for answer in answers:
+                    # Use TEI coordinates if available
+                    if answer.sentence_coords:
+                        highlighted_any = False
+                        for coords_str in answer.sentence_coords:
+                            # Parse GROBID coords format: "page,x0,y0,width,height"
+                            # Can have multiple coordinate groups separated by ';'
+                            for coord_group in coords_str.split(';'):
+                                try:
+                                    parts = coord_group.split(',')
+                                    if len(parts) >= 5:
+                                        # GROBID uses 1-indexed pages
+                                        coord_page = int(parts[0]) - 1
+                                        if coord_page == page_num:
+                                            x0 = float(parts[1])
+                                            y0 = float(parts[2])
+                                            width = float(parts[3])
+                                            height = float(parts[4])
+                                            # Convert to (x0, y0, x1, y1) format for PyMuPDF
+                                            x1 = x0 + width
+                                            y1 = y0 + height
+                                            # Create rectangle for this text region
+                                            rect = fitz.Rect(x0, y0, x1, y1)
+                                            highlight = page.add_highlight_annot(rect)
+                                            highlight.set_colors(stroke=answer.color)
+                                            highlight.update()
+                                            highlighted_any = True
+                                except (ValueError, IndexError) as e:
+                                    logger.debug(f"Could not parse coordinates '{coord_group}': {e}")
+                                    continue
                         
-                        try:
-                            areas = page.search_for(search_text)
-                            if areas:
-                                break
-                        except:
-                            pass
-                    
-                    # Highlight found areas
-                    for area in areas:
-                        highlight = page.add_highlight_annot(area)
-                        highlight.set_colors(stroke=chunk.color)
-                        highlight.update()
-                    
-                    # Add annotation with query info
-                    if areas:
-                        annot = page.add_text_annot(areas[0].tl, f"Q: {chunk.query[:50]}...")
-                        annot.update()
+                        if highlighted_any:
+                            # Add annotation with question and answer
+                            # Use first coordinate for annotation placement
+                            try:
+                                first_coords = answer.sentence_coords[0].split(';')[0]
+                                parts = first_coords.split(',')
+                                if len(parts) >= 5:
+                                    x0, y0 = float(parts[1]), float(parts[2])
+                                    answer_preview = answer.text[:100] + "..." if len(answer.text) > 100 else answer.text
+                                    annot = page.add_text_annot(
+                                        fitz.Point(x0, y0),
+                                        f"Q: {answer.query[:80]}...\nA: {answer_preview}"
+                                    )
+                                    annot.update()
+                            except:
+                                pass
+                        else:
+                            logger.warning(f"Could not highlight using coordinates on page {page_num}")
+                    else:
+                        # Fallback: try text search (old method)
+                        logger.debug(f"No coordinates available, falling back to text search for: {answer.text[:50]}...")
+                        search_texts = [
+                            answer.text,
+                            answer.text[:200],
+                            " ".join(answer.text.split()[:20]),
+                            " ".join(answer.text.split()[:10]),
+                        ]
+                        
+                        areas = []
+                        for search_text in search_texts:
+                            if not search_text.strip():
+                                continue
+                            try:
+                                areas = page.search_for(search_text)
+                                if areas:
+                                    break
+                            except:
+                                pass
+                        
+                        if areas:
+                            for area in areas:
+                                highlight = page.add_highlight_annot(area)
+                                highlight.set_colors(stroke=answer.color)
+                                highlight.update()
+                            
+                            answer_preview = answer.text[:100] + "..." if len(answer.text) > 100 else answer.text
+                            annot = page.add_text_annot(
+                                areas[0].tl,
+                                f"Q: {answer.query[:80]}...\nA: {answer_preview}"
+                            )
+                            annot.update()
+                        else:
+                            logger.warning(f"Could not find text to highlight on page {page_num}: {answer.text[:50]}...")
             
             # Use incremental save if file already exists, otherwise normal save
-            # But fall back to non-incremental if encryption prevents incremental writes
             incremental = os.path.exists(output_path) and source_pdf == output_path
             try:
                 doc.save(output_path, incremental=incremental)
             except RuntimeError as e:
                 if "encryption" in str(e).lower():
-                    # PDF has encryption, can't do incremental writes
                     doc.save(output_path, incremental=False)
                 else:
                     raise
             doc.close()
             return output_path
         except Exception as e:
-            print(f"Error highlighting PDF: {e}")
+            logger.error(f"Error highlighting PDF: {e}", exc_info=True)
             return None

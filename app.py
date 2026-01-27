@@ -67,7 +67,7 @@ def main():
     # Output directory (first thing asked)
     st.subheader("🗂️ Output Directory")
     if 'output_dir' not in st.session_state:
-        st.session_state.output_dir = "./output"
+        st.session_state.output_dir = "/Users/lizzy/_research/transformers-cn/literature_output"
     output_dir = st.text_input(
         "Base output directory (indexes, TEI cache, highlights)",
         value=st.session_state.output_dir,
@@ -80,6 +80,8 @@ def main():
         st.session_state.rag = None
     if 'search_results' not in st.session_state:
         st.session_state.search_results = []
+    if 'search_candidates' not in st.session_state:
+        st.session_state.search_candidates = []
     if 'current_index' not in st.session_state:
         st.session_state.current_index = 0
     if 'indexed' not in st.session_state:
@@ -91,7 +93,7 @@ def main():
     if 'collection_name' not in st.session_state:
         st.session_state.collection_name = None
     if 'model_name' not in st.session_state:
-        st.session_state.model_name = "BAAI/bge-small-en-v1.5"
+        st.session_state.model_name = "BAAI/bge-base-en-v1.5"
     if 'model_loaded' not in st.session_state:
         st.session_state.model_loaded = False
     if 'model_device' not in st.session_state:
@@ -268,7 +270,7 @@ def show_setup_tab():
         
         # Show current status
         if st.session_state.indexed:
-            st.success(f"✅ **Index loaded:** {len(st.session_state.rag.chunks)} chunks")
+            st.success(f"✅ **Index loaded:** {len(st.session_state.rag.paragraphs)} paragraphs")
             st.info(f"📁 Path: {st.session_state.rag.index_path}")
             
             # Force reindex button
@@ -361,26 +363,55 @@ def show_search_tab():
     with col2:
         st.info(f"**Model:** {st.session_state.model_name.split('/')[-1]}")
     with col3:
-        st.info(f"**Chunks:** {len(st.session_state.rag.chunks)}")
+        st.info(f"**Paragraphs:** {len(st.session_state.rag.paragraphs)}")
     
     st.markdown("---")
     
-    # Search interface
-    col1, col2 = st.columns([4, 1])
+    # Search interface - all in one row
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         query = st.text_input(
-            "Enter your query",
+            "Enter your question",
             placeholder="What are the main findings about...",
             key="search_input"
         )
     with col2:
-        threshold = st.number_input(
-            "Threshold",
+        retrieval_threshold = st.number_input(
+            "Retrieval Threshold",
             min_value=0.1,
-            max_value=2.0,
-            value=1.2,
+            max_value=10.0,
+            value=0.9,
             step=0.1,
-            help="Lower is stricter. Finds results within this L2 distance."
+            help="""Stage 1: Semantic Search - Retrieves paragraphs within this L2 distance from your question.
+            
+• Lower distance = better semantic match (paragraphs ranked by distance)
+• Default: 2.0 | Range: 0.1 (strict) to 10.0 (permissive)
+
+How to tune:
+• Too few candidates (< 50)? → Increase to 3.0-5.0
+• Too many irrelevant (> 1000)? → Decrease to 1.0-1.5
+• Check debug view to see retrieval scores
+
+Presets: Exploratory=3.0-5.0 | Balanced=2.0 | Precise=1.0-1.5"""
+        )
+    with col3:
+        qa_score_threshold = st.number_input(
+            "QA Score Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.1,
+            help="""Stage 2: Answer Extraction - Filters answers by QA model confidence.
+
+• Default: 0.0 (keep all) | Range: 0.0 to 1.0
+• Good answers typically score 0.1-0.9
+
+How to tune:
+1. Run search with 0.0 to see all answers
+2. Check confidence scores in results
+3. Set threshold just below good answers
+
+Presets: Exploratory=0.0 | Balanced=0.1-0.2 | Quality=0.3-0.5 | Strict=0.7+"""
         )
 
     col_search, col_clear = st.columns([1, 4])
@@ -393,16 +424,45 @@ def show_search_tab():
             st.rerun()
 
     if search_clicked and query:
-        with st.spinner("Searching..."):
-            st.session_state.search_results = st.session_state.rag.search(query, threshold=threshold)
+        # Create progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        def progress_callback(current, total, message):
+            progress = current / total if total > 0 else 0
+            progress_bar.progress(progress)
+            status_text.text(message)
+        
+        try:
+            st.session_state.search_results = st.session_state.rag.answer_question(
+                question=query,
+                retrieval_threshold=retrieval_threshold,
+                qa_score_threshold=qa_score_threshold,
+                progress_callback=progress_callback
+            )
+            progress_bar.progress(1.0)
+            status_text.text("✓ Complete!")
+            st.session_state.search_candidates = getattr(st.session_state.rag, "last_candidates", [])
             st.session_state.current_index = 0
             st.session_state.current_query = query
+        except Exception as e:
+            st.error(f"❌ Search failed: {e}")
+            st.session_state.search_results = []
+            with st.expander("Show full error"):
+                st.exception(e)
+        finally:
+            # Clean up progress indicators after a brief delay
+            import time
+            time.sleep(0.5)
+            progress_bar.empty()
+            status_text.empty()
     
     # Display results
     if st.session_state.search_results:
-        st.success(f"Found {len(st.session_state.search_results)} results for: *{st.session_state.current_query}*")
+        st.success(f"✅ Found {len(st.session_state.search_results)} answers for: *{st.session_state.current_query}*")
         
         # Navigation and actions
+        st.markdown("---")
         col1, col2, col3, col4, col5 = st.columns([1, 2, 1, 1, 1])
         
         with col1:
@@ -412,7 +472,7 @@ def show_search_tab():
                 st.rerun()
         
         with col2:
-            st.markdown(f"**Result {st.session_state.current_index + 1} / {len(st.session_state.search_results)}**")
+            st.markdown(f"**Answer {st.session_state.current_index + 1} / {len(st.session_state.search_results)}**")
         
         with col3:
             if st.button("Next ➡️"):
@@ -422,8 +482,8 @@ def show_search_tab():
         
         with col4:
             if st.button("📖 Open PDF"):
-                chunk, _ = st.session_state.search_results[st.session_state.current_index]
-                pdf_path = chunk.pdf_path
+                answer = st.session_state.search_results[st.session_state.current_index]
+                pdf_path = answer.pdf_path
                 try:
                     if sys.platform == 'darwin':  # macOS
                         subprocess.run(['open', pdf_path])
@@ -431,38 +491,38 @@ def show_search_tab():
                         os.startfile(pdf_path)
                     else:  # Linux
                         subprocess.run(['xdg-open', pdf_path])
-                    st.success(f"✅ Opened PDF at page {chunk.page_num + 1}")
+                    st.success(f"✅ Opened PDF at page {answer.page_num + 1}")
                 except Exception as e:
                     st.error(f"Could not open PDF: {e}")
         
         with col5:
             if st.button("💾 Highlight All"):
-                # Group chunks by PDF
-                pdfs_chunks = {}
-                for chunk, _ in st.session_state.search_results:
-                    if chunk.pdf_path not in pdfs_chunks:
-                        pdfs_chunks[chunk.pdf_path] = []
-                    pdfs_chunks[chunk.pdf_path].append(chunk)
-                
-                # Create output directory
+                # Answers already have the highlighting info
                 coll_name = st.session_state.rag.collection_name or "All_Library"
                 output_dir = os.path.join(st.session_state.output_dir, coll_name, "highlighted")
                 os.makedirs(output_dir, exist_ok=True)
                 
+                # Group answers by PDF
+                pdfs_answers = {}
+                for answer in st.session_state.search_results:
+                    if answer.pdf_path not in pdfs_answers:
+                        pdfs_answers[answer.pdf_path] = []
+                    pdfs_answers[answer.pdf_path].append(answer)
+                
                 highlighted_paths = []
                 progress_bar = st.progress(0)
                 
-                for idx, (pdf_path, chunks) in enumerate(pdfs_chunks.items()):
+                for idx, (pdf_path, answers) in enumerate(pdfs_answers.items()):
                     original_filename = os.path.basename(pdf_path)
                     name_without_ext = os.path.splitext(original_filename)[0]
                     output_filename = f"{name_without_ext}_highlighted.pdf"
                     output_path = os.path.join(output_dir, output_filename)
                     
-                    result_path = st.session_state.rag.highlight_pdf(chunks, output_path)
+                    result_path = st.session_state.rag.highlight_pdf(answers, output_path)
                     if result_path:
                         highlighted_paths.append(result_path)
                     
-                    progress_bar.progress((idx + 1) / len(pdfs_chunks))
+                    progress_bar.progress((idx + 1) / len(pdfs_answers))
                 
                 progress_bar.empty()
                 
@@ -477,33 +537,53 @@ def show_search_tab():
         
         # Current result display
         st.markdown("---")
-        chunk, score = st.session_state.search_results[st.session_state.current_index]
+        answer = st.session_state.search_results[st.session_state.current_index]
         
         # Result card with color indicator
-        color_hex = rgb_to_hex(chunk.color)
+        color_hex = rgb_to_hex(answer.color)
                 
-        st.subheader(f"📄 {chunk.title}")
+        st.subheader(f"📄 {answer.title}")
         st.markdown(
-            f"""**PDF**: {os.path.basename(chunk.pdf_path)}<br>
-            **Page**: {chunk.page_num + 1} | 
-            **Score**: {score:.4f} | 
+            f"""**PDF**: {os.path.basename(answer.pdf_path)}<br>
+            **Page**: {answer.page_num + 1} | 
+            **Section**: {answer.section or 'Unknown'} | 
+            **Retrieval Score**: {answer.retrieval_score:.4f} | 
+            **QA Score**: {answer.score:.4f} | 
             **Highlight Color**: <span style="color: {color_hex}; font-size: 20px;">●</span>""",
             unsafe_allow_html=True
         )
         
-        # Content
-        st.subheader("📝 Content")
+        # Answer display
+        st.subheader("💡 Answer")
+        st.info(answer.text)
+        
+        # Context
+        st.subheader("📝 Context (Full Paragraph)")
         st.text_area(
-            "Content of the selected chunk",
-            value=chunk.text,
-            height=300,
+            "Full paragraph containing the answer",
+            value=answer.context,
+            height=250,
             disabled=True,
             label_visibility="collapsed",
-            key=f"content_{st.session_state.current_index}"
+            key=f"context_{st.session_state.current_index}"
         )
     
     elif query and search_clicked:
-        st.info("No results found. Try adjusting the threshold or using different keywords.")
+        st.warning("⚠️ No results found")
+        st.info("""
+        **Possible reasons:**
+        - QA score threshold too high (try 0.0)
+        - Retrieval threshold too low (try increasing to 3.0-5.0)
+        - No semantically similar paragraphs found
+        - Question format doesn't match extractive QA style
+        
+        **Try:**
+        - Lower the QA Score Threshold to 0.0
+        - Increase Retrieval Threshold to 3.0 or higher
+        - Rephrase as a specific question (e.g., "What is X?" instead of "Tell me about X")
+        """)
+    elif not query:
+        st.info("👆 Enter a question above and click Search to get started")
     
     # Footer
     st.markdown("---")
