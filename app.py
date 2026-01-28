@@ -406,18 +406,6 @@ def show_search_tab():
     
     st.header("🔍 Search Your Library")
     
-    # Show current configuration
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        coll_name = st.session_state.rag.collection_name or "All Library"
-        st.info(f"**Collection:** {coll_name}")
-    with col2:
-        st.info(f"**Model:** {st.session_state.model_name.split('/')[-1]}")
-    with col3:
-        st.info(f"**Paragraphs:** {len(st.session_state.rag.paragraphs)}")
-    
-    st.markdown("---")
-    
     # Search interface - split into query and 3 parameter columns
     col_query, col_retrieval, col_rerank, col_qa = st.columns([3, 1, 1, 1])
     
@@ -439,15 +427,53 @@ def show_search_tab():
         rerank_threshold = st.number_input(
             "2. Rerank Thresh.",
             min_value=0.0, max_value=1.0, value=0.25, step=0.05,
-            help="Stage 2 (CrossEncoder): Minimum semantic similarity score (0.0-1.0) to keep a paragraph."
+            help="Stage 2 (CrossEncoder): Minimum semantic similarity score (0.0-1.0). "
+                 "Auto-adapts based on score distribution: more selective for clear winners, "
+                 "more lenient when scores are uniformly low."
         )
 
     with col_qa:
         qa_score_threshold = st.number_input(
             "3. QA Conf.",
             min_value=0.0, max_value=1.0, value=0.0, step=0.1,
-            help="Stage 3 (QA Model): Minimum answer confidence."
+            help="Stage 3 (QA Model): Base confidence threshold. "
+                 "Auto-adapts by question type: "
+                 "Factoid (0.10), Explanation (0.05), Comparison (0.08), Definition (0.10)."
         )
+    
+    # Add explanation about question types
+    with st.expander("ℹ️ How Question Type Detection Works"):
+        st.markdown("""
+        The system automatically detects your question type and optimizes parameters:
+        
+        **📌 Factoid** (Who/What/When/Where)
+        - Examples: "Who invented the transformer?", "When was BERT released?"
+        - QA Threshold: 0.10 (more lenient for specific facts)
+        - Answer Length: Up to 50 words (short & precise)
+        
+        **💭 Explanation** (How/Why/Explain)
+        - Examples: "How does self-attention work?", "Why is BERT effective?"
+        - QA Threshold: 0.05 (very lenient for complex answers)
+        - Answer Length: Up to 200 words (detailed explanations)
+        - Context: Adds previous + next paragraphs for more context
+        
+        **⚖️ Comparison** (Compare/Difference/Versus)
+        - Examples: "Compare BERT and GPT", "Difference between attention mechanisms"
+        - QA Threshold: 0.08
+        - Answer Length: Up to 150 words
+        - Context: Expanded to capture multiple perspectives
+        
+        **📖 Definition** (Define/What is)
+        - Examples: "What is a transformer?", "Define attention mechanism"
+        - QA Threshold: 0.10
+        - Answer Length: Up to 100 words
+        
+        **❓ General** (Everything else)
+        - QA Threshold: Uses your base setting
+        - Answer Length: Up to 150 words
+        
+        *Note: The system will automatically adjust these thresholds from your base setting.*
+        """)
 
     col_search, col_clear = st.columns([1, 4])
     with col_search:
@@ -541,6 +567,11 @@ def show_search_tab():
             st.session_state.search_candidates = getattr(st.session_state.rag, "last_candidates", [])
             st.session_state.current_index = 0
             st.session_state.current_query = query
+            
+            # Classify and store question type for display
+            question_type = st.session_state.rag.qa_engine.classify_question_type(query)
+            st.session_state.current_question_type = question_type
+            st.session_state.qa_score_threshold = qa_score_threshold  # Store base threshold
         except Exception as e:
             st.error(f"❌ Search failed: {e}")
             st.session_state.search_results = []
@@ -555,7 +586,45 @@ def show_search_tab():
     
     # Display results
     if st.session_state.search_results:
+        # Get question type info
+        question_type = st.session_state.get('current_question_type', 'unknown')
+        question_type_emoji = {
+            'factoid': '📌',
+            'explanation': '💭', 
+            'comparison': '⚖️',
+            'definition': '📖',
+            'general': '❓'
+        }.get(question_type, '❓')
+        
+        # Get the adaptive configuration for this question type
+        qa_threshold_used = st.session_state.get('qa_score_threshold', 0.0)
+        config = st.session_state.rag.qa_engine.adjust_thresholds_by_type(question_type, qa_threshold_used)
+        
         st.success(f"✅ Found {len(st.session_state.search_results)} answers for: *{st.session_state.current_query}*")
+        
+        # Show question type with detailed threshold info in a single merged display
+        # Add special notes based on question type
+        notes = {
+            'factoid': '→ Optimized for short, precise answers',
+            'explanation': '→ Very lenient threshold, allows longer detailed answers',
+            'comparison': '→ Seeks diverse perspectives',
+            'definition': '→ Balanced threshold for informative answers',
+            'general': '→ Standard parameters'
+        }
+        
+        # Build combined info display
+        combined_info = f"""
+        {question_type_emoji} **Question Type:** {question_type.title()}
+        
+        **Adaptive Parameters Applied:**
+        - QA Confidence: {config['qa_score_threshold']:.3f} (base: {qa_threshold_used:.3f})
+        - Max Answer Length: {config['max_answer_length']} words
+        - Min Answer Words: {config['min_answer_words']} words
+        
+        {notes.get(question_type, '')}
+        """
+        
+        st.info(combined_info)
         
         # Navigation and actions
         st.markdown("---")

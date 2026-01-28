@@ -41,6 +41,146 @@ class QAEngine:
             logger.warning(f"Could not load QA model {self.model_name}: {e}")
             self.pipeline = None
     
+    def classify_question_type(self, question: str) -> str:
+        """Classify the type of question being asked.
+        
+        Args:
+            question: The question text.
+            
+        Returns:
+            Question type: 'factoid', 'explanation', 'comparison', 'definition', or 'general'.
+        """
+        question_lower = question.lower().strip()
+        
+        # Definition questions
+        if 'define' in question_lower or 'what is' in question_lower or 'what are' in question_lower:
+            return 'definition'
+        
+        # Factoid questions
+        if any(question_lower.startswith(w) for w in ['who ', 'what ', 'when ', 'where ']):
+            return 'factoid'
+        
+        # Comparison/list questions
+        if any(word in question_lower for word in ['compare', 'difference', 'versus', 'vs', 'list ']):
+            return 'comparison'
+        
+        # Explanation questions
+        if any(question_lower.startswith(w) for w in ['how ', 'why ', 'explain ']):
+            return 'explanation'
+        
+        return 'general'
+    
+    def adjust_thresholds_by_type(self, question_type: str, base_threshold: float) -> dict:
+        """Return adjusted parameters based on question type.
+        
+        Args:
+            question_type: The classified question type.
+            base_threshold: The base QA score threshold to adjust from.
+            
+        Returns:
+            Dictionary with adjusted parameters for this question type.
+        """
+        configs = {
+            'factoid': {
+                'qa_score_threshold': max(0.1, base_threshold),  # More lenient
+                'max_answer_length': 50,     # Shorter answers
+                'min_answer_words': 2,       # Allow shorter answers
+                'prefer_entities': True
+            },
+            'explanation': {
+                'qa_score_threshold': max(0.05, base_threshold * 0.5),  # Very lenient
+                'max_answer_length': 200,    # Longer answers allowed
+                'min_answer_words': 3,       # Normal minimum
+                'prefer_entities': False
+            },
+            'comparison': {
+                'qa_score_threshold': max(0.08, base_threshold * 0.8),
+                'max_answer_length': 150,
+                'min_answer_words': 3,
+                'prefer_diversity': True     # Want different perspectives
+            },
+            'definition': {
+                'qa_score_threshold': max(0.1, base_threshold),
+                'max_answer_length': 100,
+                'min_answer_words': 3,
+                'prefer_entities': False
+            },
+            'general': {
+                'qa_score_threshold': base_threshold,
+                'max_answer_length': 150,
+                'min_answer_words': 3,
+                'prefer_entities': False
+            }
+        }
+        return configs.get(question_type, configs['general'])
+    
+    def get_adaptive_context(self, paragraph: Paragraph, original_idx: int, 
+                           all_paragraphs: List[Paragraph], 
+                           question_type: str) -> Tuple[str, int, dict]:
+        """Get context adaptively based on paragraph properties and question type.
+        
+        Args:
+            paragraph: The current paragraph.
+            original_idx: Index of the paragraph in all_paragraphs.
+            all_paragraphs: Full list of all paragraphs.
+            question_type: The classified question type.
+            
+        Returns:
+            Tuple of (combined_text, shift_offset, context_info) where:
+            - combined_text: The text to use for QA
+            - shift_offset: Character position where current paragraph starts
+            - context_info: Dict with context expansion details
+        """
+        combined_text = paragraph.text
+        shift_offset = 0
+        para_word_count = len(paragraph.text.split())
+        
+        context_info = {
+            'expanded': False,
+            'added_prev': False,
+            'added_next': False,
+            'original_words': para_word_count,
+            'final_words': para_word_count,
+            'expansion_reason': None
+        }
+        
+        # Determine if context expansion is needed
+        is_short = para_word_count < 50
+        needs_more_context = question_type in ['explanation', 'comparison']
+        
+        should_expand = is_short or needs_more_context
+        
+        if is_short:
+            context_info['expansion_reason'] = f'short paragraph ({para_word_count} words)'
+        elif needs_more_context:
+            context_info['expansion_reason'] = f'{question_type} question needs context'
+        
+        if not should_expand:
+            return combined_text, shift_offset, context_info
+        
+        # Try to get previous paragraph if from same section and PDF
+        if original_idx > 0:
+            prev = all_paragraphs[original_idx - 1]
+            if (prev.pdf_path == paragraph.pdf_path and 
+                prev.section == paragraph.section):  # Same section
+                combined_text = prev.text + " " + paragraph.text
+                shift_offset = len(prev.text) + 1
+                context_info['expanded'] = True
+                context_info['added_prev'] = True
+                context_info['final_words'] += len(prev.text.split())
+        
+        # For explanation questions, also try next paragraph
+        if question_type == 'explanation' and original_idx < len(all_paragraphs) - 1:
+            next_para = all_paragraphs[original_idx + 1]
+            if (next_para.pdf_path == paragraph.pdf_path and 
+                next_para.section == paragraph.section):
+                combined_text = combined_text + " " + next_para.text
+                context_info['expanded'] = True
+                context_info['added_next'] = True
+                context_info['final_words'] += len(next_para.text.split())
+        
+        return combined_text, shift_offset, context_info
+    
     def _expand_to_sentences(self, paragraph: Paragraph, 
                             start_char: int, 
                             end_char: int) -> Tuple[str, int, int, List[str]]:
@@ -123,33 +263,41 @@ class QAEngine:
         if not candidates:
             return []
         
+        # Classify question type and adjust thresholds
+        question_type = self.classify_question_type(question)
+        config = self.adjust_thresholds_by_type(question_type, qa_score_threshold)
+        logger.info(f"Question type: {question_type}, adjusted threshold: {config['qa_score_threshold']:.3f}")
+        
         answers = []
+        context_stats = {'expanded': 0, 'not_expanded': 0, 'added_prev': 0, 'added_next': 0}
         
         for i, (paragraph, retrieval_score, original_idx, rerank_score) in enumerate(candidates):
             if progress_callback:
                 progress_callback(i, len(candidates), 
                                 f"QA Analysis: Paragraph {i+1}/{len(candidates)}")
             
-            # --- CONTEXT OVERLAP LOGIC ---
-            # Check if there's a previous paragraph from the same document
-            prev_paragraph = None
-            combined_text = paragraph.text
-            shift_offset = 0
+            # Get adaptive context based on question type
+            combined_text, shift_offset, context_info = self.get_adaptive_context(
+                paragraph, original_idx, all_paragraphs, question_type
+            )
             
-            if original_idx > 0:
-                potential_prev = all_paragraphs[original_idx - 1]
-                if potential_prev.pdf_path == paragraph.pdf_path:
-                    prev_paragraph = potential_prev
-                    combined_text = prev_paragraph.text + " " + paragraph.text
-                    shift_offset = len(prev_paragraph.text) + 1
+            # Track context expansion statistics
+            if context_info['expanded']:
+                context_stats['expanded'] += 1
+                if context_info['added_prev']:
+                    context_stats['added_prev'] += 1
+                if context_info['added_next']:
+                    context_stats['added_next'] += 1
+            else:
+                context_stats['not_expanded'] += 1
             
             # Run QA model
             qa_input = {'question': question, 'context': combined_text}
             result = self.pipeline(**qa_input)
             
             if result:
-                # Filter very short answers
-                if len(result['answer'].split()) < 3:
+                # Filter based on question-type-specific minimum words
+                if len(result['answer'].split()) < config['min_answer_words']:
                     continue
                 
                 raw_answer = result['answer']
@@ -157,23 +305,26 @@ class QAEngine:
                 raw_end = result.get('end', len(raw_answer))
                 
                 # Determine which paragraph the answer belongs to
+                # If shift_offset > 0, we have prepended context from previous paragraph(s)
                 target_paragraph = paragraph
                 local_start = raw_start
                 local_end = raw_end
                 
-                if prev_paragraph and raw_end <= shift_offset:
-                    # Answer is entirely in previous paragraph
-                    target_paragraph = prev_paragraph
-                elif prev_paragraph and raw_start >= shift_offset:
-                    # Answer is entirely in current paragraph
-                    target_paragraph = paragraph
-                    local_start = raw_start - shift_offset
-                    local_end = raw_end - shift_offset
-                elif prev_paragraph:
-                    # Answer spans both paragraphs; use current paragraph
-                    target_paragraph = paragraph
-                    local_start = max(0, raw_start - shift_offset)
-                    local_end = raw_end - shift_offset
+                if shift_offset > 0:
+                    if raw_end <= shift_offset:
+                        # Answer is entirely in previous context - try to find source paragraph
+                        if original_idx > 0:
+                            prev = all_paragraphs[original_idx - 1]
+                            if prev.pdf_path == paragraph.pdf_path:
+                                target_paragraph = prev
+                    elif raw_start >= shift_offset:
+                        # Answer is entirely in current paragraph
+                        local_start = raw_start - shift_offset
+                        local_end = raw_end - shift_offset
+                    else:
+                        # Answer spans contexts; use current paragraph
+                        local_start = max(0, raw_start - shift_offset)
+                        local_end = raw_end - shift_offset
 
                 # Expand to sentence boundaries
                 expanded_text, new_start, new_end, sentence_coords = self._expand_to_sentences(
@@ -211,7 +362,8 @@ class QAEngine:
         seen_answers = set()
         
         for ans in answers:
-            if ans.score < qa_score_threshold:
+            # Use question-type-specific threshold
+            if ans.score < config['qa_score_threshold']:
                 continue
                 
             # Normalize text to catch minor variations
@@ -222,5 +374,10 @@ class QAEngine:
                 seen_answers.add(signature)
                 unique_answers.append(ans)
         
+        # Log context expansion statistics
+        logger.info(f"Context expansion stats: {context_stats['expanded']} expanded "
+                   f"({context_stats['added_prev']} +prev, {context_stats['added_next']} +next), "
+                   f"{context_stats['not_expanded']} not expanded")
         logger.info(f"Extracted {len(unique_answers)} unique answers from {len(candidates)} candidates")
+        
         return unique_answers
