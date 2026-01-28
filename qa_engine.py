@@ -194,7 +194,8 @@ class QAEngine:
                     query=question,
                     color=color,
                     sentence_coords=sentence_coords,
-                    retrieval_score=retrieval_score
+                    retrieval_score=retrieval_score,
+                    rerank_score=rerank_score
                 )
                 answers.append(answer)
         

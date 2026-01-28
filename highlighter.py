@@ -118,9 +118,17 @@ class PDFHighlighter:
                                                 x0, y0 = float(parts[1]), float(parts[2])
                                                 answer_preview = answer.text[:100] + "..." \
                                                                 if len(answer.text) > 100 else answer.text
+                                                annot_text = (
+                                                    f"Q: {answer.query}\n\n"
+                                                    f"A: {answer_preview}\n\n"
+                                                    f"Scores:\n"
+                                                    f"• Retrieval: {answer.retrieval_score:.4f}\n"
+                                                    f"• Rerank: {answer.rerank_score:.4f}\n"
+                                                    f"• QA Confidence: {answer.score:.4f}"
+                                                )
                                                 annot = page.add_text_annot(
                                                     self.fitz.Point(x0, y0),
-                                                    f"Q: {answer.query[:80]}...\nA: {answer_preview}"
+                                                    annot_text
                                                 )
                                                 annot.update()
                                                 found_annotation_spot = True

@@ -644,6 +644,7 @@ def show_search_tab():
             **Page**: {answer.page_num + 1} | 
             **Section**: {answer.section or 'Unknown'} | 
             **Retrieval Score**: {answer.retrieval_score:.4f} | 
+            **Rerank Score**: {answer.rerank_score:.4f} | 
             **QA Score**: {answer.score:.4f} | 
             **Highlight Color**: <span style="color: {color_hex}; font-size: 20px;">●</span>""",
             unsafe_allow_html=True

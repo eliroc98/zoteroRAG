@@ -42,6 +42,7 @@ class Answer:
     color: Tuple[float, float, float] = field(default_factory=lambda: (1, 1, 0))
     sentence_coords: List[str] = field(default_factory=list)  # TEI coordinates for highlighting
     retrieval_score: float = 0.0  # Semantic search distance/score
+    rerank_score: float = 0.0  # CrossEncoder reranking score
     
     def __reduce__(self):
         """Custom pickle support for dataclass."""
@@ -49,5 +50,5 @@ class Answer:
             self.__class__,
             (self.text, self.context, self.pdf_path, self.page_num, self.item_key, self.title,
              self.section, self.start_char, self.end_char, self.score, self.query, self.color, 
-             self.sentence_coords, self.retrieval_score)
+             self.sentence_coords, self.retrieval_score, self.rerank_score)
         )
