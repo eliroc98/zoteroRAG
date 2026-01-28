@@ -194,14 +194,49 @@ def show_setup_tab():
         help="Enter the HuggingFace model identifier (e.g., 'all-MiniLM-L6-v2' or 'BAAI/bge-small-en-v1.5')"
     )
 
-    device_choice = st.selectbox(
-        "Device",
-        options=["auto", "cpu", "mps", "cuda"],
-        index=["auto", "cpu", "mps", "cuda"].index(
-            "auto" if st.session_state.model_device is None else st.session_state.model_device
-        ),
-        help="Select compute device. 'auto' picks MPS if available, else CPU."
-    )
+    col_device, col_encode_batch, col_rerank_batch = st.columns(3)
+    
+    with col_device:
+        device_choice = st.selectbox(
+            "Device",
+            options=["auto", "cpu", "mps", "cuda"],
+            index=["auto", "cpu", "mps", "cuda"].index(
+                "auto" if st.session_state.model_device is None else st.session_state.model_device
+            ),
+            help="Select compute device. 'auto' picks MPS if available, else CPU."
+        )
+    
+    with col_encode_batch:
+        encode_batch_auto = st.checkbox(
+            "Auto-detect encoding batch",
+            value=st.session_state.get('encode_batch_auto', True),
+            help="Auto-detect safe batch size (targets 75% memory usage)"
+        )
+        if not encode_batch_auto:
+            encode_batch_size = st.number_input(
+                "Encoding batch size",
+                min_value=1, max_value=256, value=st.session_state.get('encode_batch_size', 8),
+                help="Manual batch size for encoding"
+            )
+        else:
+            encode_batch_size = None
+            st.session_state.encode_batch_auto = True
+    
+    with col_rerank_batch:
+        rerank_batch_auto = st.checkbox(
+            "Auto-detect rerank batch",
+            value=st.session_state.get('rerank_batch_auto', True),
+            help="Auto-detect safe batch size (targets 75% memory usage)"
+        )
+        if not rerank_batch_auto:
+            rerank_batch_size = st.number_input(
+                "Reranking batch size",
+                min_value=1, max_value=256, value=st.session_state.get('rerank_batch_size', 8),
+                help="Manual batch size for reranking"
+            )
+        else:
+            rerank_batch_size = None
+            st.session_state.rerank_batch_auto = True
     
     if st.button("📥 Load Model", type="primary", use_container_width=True):
         if model_input:
@@ -210,16 +245,32 @@ def show_setup_tab():
                     st.session_state.model_name = model_input
                     st.session_state.grobid_url = grobid_url
                     st.session_state.model_device = None if device_choice == "auto" else device_choice
+                    st.session_state.encode_batch_size = encode_batch_size
+                    st.session_state.rerank_batch_size = rerank_batch_size
                     st.session_state.rag = ZoteroRAG(
                         collection_name=st.session_state.collection_name,
                         model_name=model_input,
                         grobid_url=grobid_url,
                         output_base_dir=st.session_state.output_dir,
-                        model_device=st.session_state.model_device
+                        model_device=st.session_state.model_device,
+                        encode_batch_size=encode_batch_size,
+                        rerank_batch_size=rerank_batch_size
                     )
                     st.session_state.model_loaded = True
                     st.session_state.indexed = False  # Reset indexed status
-                    st.success(f"✅ Model loaded: {model_input}")
+                    
+                    # Show configuration summary
+                    batch_info = []
+                    if encode_batch_size is None:
+                        batch_info.append("Encoding: Auto-detect")
+                    else:
+                        batch_info.append(f"Encoding: {encode_batch_size}")
+                    if rerank_batch_size is None:
+                        batch_info.append("Reranking: Auto-detect")
+                    else:
+                        batch_info.append(f"Reranking: {rerank_batch_size}")
+                    
+                    st.success(f"✅ Model loaded: {model_input}\n\n**Batch sizes:** {' | '.join(batch_info)}")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error loading model: {e}")
@@ -408,30 +459,85 @@ def show_search_tab():
             st.rerun()
 
     if search_clicked and query:
-        # Create progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        import time
         
-        # Generic callback for both stages to update the same UI element
-        def ui_callback(current, total, message):
+        # Create separate progress tracking for each stage
+        st.markdown("#### Processing Pipeline")
+        
+        rerank_status = st.empty()
+        rerank_progress_bar = st.progress(0)
+        
+        qa_status = st.empty()
+        qa_progress_bar = st.progress(0)
+        
+        # Track timing for each stage
+        rerank_start_time = [None]  # Use list for mutability in nested function
+        qa_start_time = [None]
+        
+        def rerank_callback(current, total, message):
+            if rerank_start_time[0] is None:
+                rerank_start_time[0] = time.time()
+            
             if total > 0:
                 progress = current / total
+                rerank_progress_bar.progress(progress)
+                
+                # Calculate time estimates
+                elapsed = time.time() - rerank_start_time[0]
+                if current > 0 and progress < 1.0:
+                    estimated_total = elapsed / progress
+                    remaining = estimated_total - elapsed
+                    time_info = f"⏱️ Elapsed: {elapsed:.1f}s | Remaining: ~{remaining:.1f}s"
+                elif progress >= 1.0:
+                    time_info = f"⏱️ Completed in {elapsed:.1f}s"
+                else:
+                    time_info = ""
             else:
-                progress = 0
-            progress_bar.progress(progress)
-            status_text.text(message)
+                rerank_progress_bar.progress(0)
+                time_info = ""
+            
+            rerank_status.text(f"🔄 Stage 1 - Reranking: {message} {time_info}")
+        
+        def qa_callback(current, total, message):
+            if qa_start_time[0] is None:
+                qa_start_time[0] = time.time()
+            
+            if total > 0:
+                progress = current / total
+                qa_progress_bar.progress(progress)
+                
+                # Calculate time estimates
+                elapsed = time.time() - qa_start_time[0]
+                if current > 0 and progress < 1.0:
+                    estimated_total = elapsed / progress
+                    remaining = estimated_total - elapsed
+                    time_info = f"⏱️ Elapsed: {elapsed:.1f}s | Remaining: ~{remaining:.1f}s"
+                elif progress >= 1.0:
+                    time_info = f"⏱️ Completed in {elapsed:.1f}s"
+                else:
+                    time_info = ""
+            else:
+                qa_progress_bar.progress(0)
+                time_info = ""
+            
+            qa_status.text(f"🤖 Stage 2 - QA Extraction: {message} {time_info}")
         
         try:
             st.session_state.search_results = st.session_state.rag.answer_question(
                 question=query,
                 retrieval_threshold=retrieval_threshold,
                 qa_score_threshold=qa_score_threshold,
-                rerank_threshold=rerank_threshold,  # New threshold
-                progress_callback=ui_callback,      # QA callback
-                rerank_callback=ui_callback         # CrossEncoder callback
+                rerank_threshold=rerank_threshold,
+                progress_callback=qa_callback,
+                rerank_callback=rerank_callback
             )
-            progress_bar.progress(1.0)
-            status_text.text("✓ Complete!")
+            
+            # Mark completion
+            rerank_progress_bar.progress(1.0)
+            qa_progress_bar.progress(1.0)
+            rerank_status.text("🔄 Stage 1 - Reranking: ✓ Complete!")
+            qa_status.text("🤖 Stage 2 - QA Extraction: ✓ Complete!")
+            
             st.session_state.search_candidates = getattr(st.session_state.rag, "last_candidates", [])
             st.session_state.current_index = 0
             st.session_state.current_query = query
@@ -441,10 +547,11 @@ def show_search_tab():
             with st.expander("Show full error"):
                 st.exception(e)
         finally:
-            import time
-            time.sleep(0.5)
-            progress_bar.empty()
-            status_text.empty()
+            time.sleep(1.0)
+            rerank_status.empty()
+            rerank_progress_bar.empty()
+            qa_status.empty()
+            qa_progress_bar.empty()
     
     # Display results
     if st.session_state.search_results:
