@@ -2,6 +2,8 @@
 
 import os
 import logging
+import tempfile
+import shutil
 from typing import List
 
 from models import Answer
@@ -42,87 +44,122 @@ class PDFHighlighter:
             source_pdf = output_path if os.path.exists(output_path) else answers[0].pdf_path
             doc = self.fitz.open(source_pdf)
             
-            # Group answers by page
-            answers_by_page = {}
+            # Group answers by the actual pages their coordinates reference
+            # (not by answer.page_num which may be wrong for multi-page paragraphs)
+            coords_by_page = {}
             for answer in answers:
-                answers_by_page.setdefault(answer.page_num, []).append(answer)
+                if answer.sentence_coords:
+                    for coords_str in answer.sentence_coords:
+                        for coord_group in coords_str.split(';'):
+                            try:
+                                parts = coord_group.strip().split(',')
+                                if len(parts) >= 5:
+                                    # GROBID uses 1-indexed pages
+                                    coord_page = int(parts[0]) - 1
+                                    if coord_page not in coords_by_page:
+                                        coords_by_page[coord_page] = []
+                                    coords_by_page[coord_page].append((answer, coord_group))
+                            except (ValueError, IndexError):
+                                continue
             
-            # Process each page
-            for page_num, page_answers in answers_by_page.items():
+            # Process each page that has coordinates
+            for page_num, page_data in coords_by_page.items():
+                if page_num >= len(doc):
+                    logger.warning(f"Page {page_num} referenced in coords but PDF only has {len(doc)} pages")
+                    continue
+                    
                 page = doc[page_num]
                 
-                for answer in page_answers:
-                    highlighted_any = False
-
-                    # Use TEI coordinates if available
-                    if answer.sentence_coords:
-                        for coords_str in answer.sentence_coords:
-                            # Parse GROBID coords format: "page,x0,y0,width,height"
-                            # Can have multiple coordinate groups separated by ';'
-                            for coord_group in coords_str.split(';'):
-                                try:
-                                    parts = coord_group.split(',')
-                                    if len(parts) >= 5:
-                                        # GROBID uses 1-indexed pages
-                                        coord_page = int(parts[0]) - 1
-                                        if coord_page == page_num:
-                                            x0 = float(parts[1])
-                                            y0 = float(parts[2])
-                                            width = float(parts[3])
-                                            height = float(parts[4])
-                                            # Convert to (x0, y0, x1, y1) format for PyMuPDF
-                                            x1 = x0 + width
-                                            y1 = y0 + height
-                                            # Create rectangle for this text region
-                                            rect = self.fitz.Rect(x0, y0, x1, y1)
-                                            highlight = page.add_highlight_annot(rect)
-                                            highlight.set_colors(stroke=answer.color)
-                                            highlight.update()
-                                            highlighted_any = True
-                                except (ValueError, IndexError) as e:
-                                    logger.debug(f"Could not parse coordinates '{coord_group}': {e}")
-                                    continue
+                # Group by answer ID to track if we highlighted anything for each
+                # (using id() since Answer objects aren't hashable)
+                answer_highlighted = {}
+                answer_by_id = {}
+                
+                for answer, coord_group in page_data:
+                    answer_id = id(answer)
+                    if answer_id not in answer_highlighted:
+                        answer_highlighted[answer_id] = False
+                        answer_by_id[answer_id] = answer
                         
-                        if highlighted_any:
-                            # Add annotation with question and answer
-                            # Use first coordinate for annotation placement
+                    try:
+                        parts = coord_group.strip().split(',')
+                        if len(parts) >= 5:
+                            x0 = float(parts[1])
+                            y0 = float(parts[2])
+                            width = float(parts[3])
+                            height = float(parts[4])
+                            # Convert to (x0, y0, x1, y1) format for PyMuPDF
+                            x1 = x0 + width
+                            y1 = y0 + height
+                            # Create rectangle for this text region
+                            rect = self.fitz.Rect(x0, y0, x1, y1)
+                            highlight = page.add_highlight_annot(rect)
+                            highlight.set_colors(stroke=answer.color)
+                            highlight.update()
+                            answer_highlighted[answer_id] = True
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"Could not parse coordinates '{coord_group}': {e}")
+                        continue
+                
+                # Add annotations for answers that were highlighted on this page
+                for answer_id, was_highlighted in answer_highlighted.items():
+                    if was_highlighted:
+                        answer = answer_by_id[answer_id]
+                        if answer.sentence_coords:
                             try:
-                                first_coords = answer.sentence_coords[0].split(';')[0]
-                                parts = first_coords.split(',')
-                                if len(parts) >= 5:
-                                    x0, y0 = float(parts[1]), float(parts[2])
-                                    answer_preview = answer.text[:100] + "..." \
-                                                    if len(answer.text) > 100 else answer.text
-                                    annot = page.add_text_annot(
-                                        self.fitz.Point(x0, y0),
-                                        f"Q: {answer.query[:80]}...\nA: {answer_preview}"
-                                    )
-                                    annot.update()
-                            except:
-                                logger.warning(f"Could not annotate {answer.pdf_path}.")
+                                # Find first coord on this page for annotation placement
+                                found_annotation_spot = False
+                                for coords_str in answer.sentence_coords:
+                                    for coord_group in coords_str.split(';'):
+                                        parts = coord_group.strip().split(',')
+                                        if len(parts) >= 5:
+                                            coord_page = int(parts[0]) - 1
+                                            if coord_page == page_num:
+                                                x0, y0 = float(parts[1]), float(parts[2])
+                                                answer_preview = answer.text[:100] + "..." \
+                                                                if len(answer.text) > 100 else answer.text
+                                                annot = page.add_text_annot(
+                                                    self.fitz.Point(x0, y0),
+                                                    f"Q: {answer.query[:80]}...\nA: {answer_preview}"
+                                                )
+                                                annot.update()
+                                                found_annotation_spot = True
+                                                break
+                                    if found_annotation_spot:
+                                        break
+                            except Exception as e:
+                                logger.debug(f"Could not annotate on page {page_num}: {e}")
                                 continue
-                        else:
-                            logger.warning(
-                                f"Could not highlight {answer.pdf_path} using coordinates "
-                                f"on page {page_num}."
-                            )
-
-                    if not highlighted_any:
-                        logger.warning(
-                            f"Could not highlight {answer.pdf_path} using TEI coordinates "
-                            f"on page {page_num}: {answer.text[:50]}... Skipping fallback search."
-                        )
             
-            # Use incremental save if file already exists, otherwise normal save
-            incremental = os.path.exists(output_path) and source_pdf == output_path
+            # Save the PDF with all highlights
+            # Always create a temporary file first, then replace the original
+            # This avoids incremental save issues and encryption problems
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.pdf', dir=os.path.dirname(output_path))
+            os.close(temp_fd)  # Close the file descriptor, we'll use the path
+            
             try:
-                doc.save(output_path, incremental=incremental)
-            except RuntimeError as e:
-                if "encryption" in str(e).lower():
-                    doc.save(output_path, incremental=False)
-                else:
-                    raise
-            doc.close()
+                # Save to temporary file with non-incremental save
+                try:
+                    doc.save(temp_path, incremental=False, deflate=True)
+                except Exception as e:
+                    # Fallback without deflate if it fails
+                    error_msg = str(e).lower()
+                    if "deflate" in error_msg or "encryption" in error_msg:
+                        logger.debug(f"Save with deflate failed, retrying without: {e}")
+                        doc.save(temp_path, incremental=False, deflate=False)
+                    else:
+                        raise
+                
+                doc.close()
+                
+                # Replace the original file with the new one
+                shutil.move(temp_path, output_path)
+                
+            except Exception as e:
+                # Clean up temp file if something went wrong
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
             
             logger.info(f"PDF highlighted and saved to {output_path}")
             return output_path
