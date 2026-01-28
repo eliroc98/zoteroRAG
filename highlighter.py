@@ -120,7 +120,6 @@ class PDFHighlighter:
                                                                 if len(answer.text) > 100 else answer.text
                                                 annot_text = (
                                                     f"Q: {answer.query}\n\n"
-                                                    f"A: {answer_preview}\n\n"
                                                     f"Scores:\n"
                                                     f"• Retrieval: {answer.retrieval_score:.4f}\n"
                                                     f"• Rerank: {answer.rerank_score:.4f}\n"
