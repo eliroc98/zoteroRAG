@@ -113,7 +113,8 @@ class Reranker:
     def rerank(self, query: str, 
                candidates: List[Tuple[Paragraph, float, int]], 
                threshold: float = 0.25,
-               progress_callback=None) -> List[Tuple[Paragraph, float, int, float]]:
+               progress_callback=None,
+               query_variations: List[str] = None) -> List[Tuple[Paragraph, float, int, float]]:
         """Rerank candidates using cross-encoder scores.
         
         Args:
@@ -121,6 +122,7 @@ class Reranker:
             candidates: List of (Paragraph, retrieval_score, original_index) tuples.
             threshold: Minimum probability threshold to keep candidates.
             progress_callback: Function(current, total, message) for progress updates.
+            query_variations: List of query paraphrases to average scores over.
             
         Returns:
             List of (Paragraph, retrieval_score, original_index, rerank_score) tuples,
@@ -128,6 +130,9 @@ class Reranker:
         """
         if not candidates:
             return []
+        
+        # Use query variations if provided, otherwise just use the original query
+        queries_to_use = query_variations if query_variations else [query]
         
         # Prepare pairs for the reranker
         pairs = [[query, p[0].text] for p in candidates]
@@ -142,35 +147,48 @@ class Reranker:
         else:
             effective_batch_size = self.batch_size
         
-        if progress_callback:
-            progress_callback(0, len(candidates), 
-                            f"Cross-Encoding {len(candidates)} candidates (batch size: {effective_batch_size})...")
+        # Score candidates with each query variation and average
+        all_probs_per_variation = []
         
-        # Predict scores in batches with progress tracking
-        all_scores = []
-        num_batches = (len(pairs) + effective_batch_size - 1) // effective_batch_size
+        total_operations = len(queries_to_use) * len(candidates)
+        completed_operations = 0
         
-        for batch_idx, i in enumerate(range(0, len(pairs), effective_batch_size)):
-            batch_pairs = pairs[i:i + effective_batch_size]
+        for var_idx, q_var in enumerate(queries_to_use):
+            # Prepare pairs for this variation
+            var_pairs = [[q_var, p[0].text] for p in candidates]
             
-            # Update progress before processing batch
-            if progress_callback:
-                progress_callback(i, len(pairs), 
-                                f"Processing batch {batch_idx + 1}/{num_batches}...")
+            # Predict scores in batches with progress tracking
+            all_scores = []
+            num_batches = (len(var_pairs) + effective_batch_size - 1) // effective_batch_size
             
-            batch_scores = self.model.predict(batch_pairs, show_progress_bar=False)
-            all_scores.extend(batch_scores)
+            for batch_idx, i in enumerate(range(0, len(var_pairs), effective_batch_size)):
+                batch_pairs = var_pairs[i:i + effective_batch_size]
+                
+                batch_scores = self.model.predict(batch_pairs, show_progress_bar=False)
+                all_scores.extend(batch_scores)
+                
+                # Update progress with current variation info
+                processed_in_batch = min(len(batch_pairs), len(var_pairs) - i)
+                completed_operations += processed_in_batch
+                
+                if progress_callback:
+                    variation_info = f"Paraphrase {var_idx + 1}/{len(queries_to_use)}" if len(queries_to_use) > 1 else ""
+                    batch_info = f"Batch {batch_idx + 1}/{num_batches}"
+                    message = f"{variation_info} - {batch_info}" if variation_info else batch_info
+                    progress_callback(completed_operations, total_operations, message)
             
-            # Update progress after processing batch
-            if progress_callback:
-                processed = min(i + effective_batch_size, len(pairs))
-                progress_callback(processed, len(pairs), 
-                                f"Completed {processed}/{len(pairs)} candidates...")
+            raw_scores = np.array(all_scores)
+            
+            # Apply Sigmoid to convert logits to 0-1 probabilities
+            var_probs = 1 / (1 + np.exp(-raw_scores))
+            all_probs_per_variation.append(var_probs)
         
-        raw_scores = np.array(all_scores)
-        
-        # Apply Sigmoid to convert logits to 0-1 probabilities
-        probs = 1 / (1 + np.exp(-raw_scores))
+        # Calculate max probabilities across all variations
+        if len(all_probs_per_variation) > 1:
+            probs = np.max(all_probs_per_variation, axis=0)
+            logger.info(f"Using max rerank scores across {len(queries_to_use)} query variations")
+        else:
+            probs = all_probs_per_variation[0]
         
         # Adapt threshold based on score distribution
         adjusted_threshold = self.adaptive_rerank_threshold(probs, threshold)

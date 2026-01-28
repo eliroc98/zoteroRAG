@@ -284,7 +284,12 @@ class ZoteroRAG:
                        qa_score_threshold: float = 0.0, 
                        rerank_threshold: float = 0.25, 
                        progress_callback=None, 
-                       rerank_callback=None) -> List[Answer]:
+                       rerank_callback=None,
+                       question_type: str = 'general',
+                       custom_config: dict = None,
+                       num_paraphrases: int = 2,
+                       highlight_color: Tuple[float, float, float] = None,
+                       question_variations: List[str] = None) -> List[Answer]:
         """Answer a question using the full RAG pipeline.
         
         Pipeline stages:
@@ -299,6 +304,11 @@ class ZoteroRAG:
             rerank_threshold: Minimum rerank probability to keep candidates.
             progress_callback: Function(current, total, message) for QA progress.
             rerank_callback: Function(current, total, message) for rerank progress.
+            question_type: Type of question (factoid, explanation, methodology, etc.).
+            custom_config: Custom configuration dict to override preset config.
+            num_paraphrases: Number of question paraphrases to generate (0 = disabled).
+            highlight_color: RGB tuple (0-1) for highlighting. If None, use query-based color.
+            question_variations: Pre-generated question variations to use. If None, generate them.
             
         Returns:
             List of Answer objects, deduplicated and sorted by score.
@@ -306,11 +316,39 @@ class ZoteroRAG:
         if not self.indexer.index:
             raise ValueError("Index is not built. Call build_index() first.")
         
+        # Stage 0: Expand question if enabled and variations not provided
+        if question_variations is None:
+            question_variations = [question]  # Always include original
+            if self.qa_engine.enable_question_expansion and num_paraphrases > 0:
+                question_variations = self.qa_engine.expand_question(question, num_variations=num_paraphrases)
+                logger.info(f"Question expansion: {len(question_variations)} variations generated")
+            elif num_paraphrases == 0:
+                logger.info("Question paraphrasing disabled by user")
+        else:
+            logger.info(f"Using {len(question_variations)} pre-selected question variations")
+        
         # Stage 1: Retrieve candidate paragraphs (FAISS)
-        candidates = self.indexer.search(question, retrieval_threshold)
+        # Search with all question variations and merge results
+        all_candidates = []
+        seen_paragraphs = set()
+        
+        for i, q_var in enumerate(question_variations):
+            var_candidates = self.indexer.search(q_var, retrieval_threshold)
+            logger.debug(f"Variation {i}: '{q_var}' -> {len(var_candidates)} candidates")
+            
+            # Add unseen candidates
+            for para, score, idx in var_candidates:
+                para_id = (para.pdf_path, para.page_num, para.text[:100])  # Unique identifier
+                if para_id not in seen_paragraphs:
+                    seen_paragraphs.add(para_id)
+                    all_candidates.append((para, score, idx))
+        
+        # Sort by retrieval score
+        all_candidates.sort(key=lambda x: x[1])
+        candidates = all_candidates
         
         logger.debug(f"Question: {question}")
-        logger.debug(f"Retrieved {len(candidates)} paragraphs within L2 distance {retrieval_threshold}")
+        logger.debug(f"Retrieved {len(candidates)} unique paragraphs from {len(question_variations)} variations")
         
         if not candidates:
             self.last_candidates = []
@@ -331,7 +369,8 @@ class ZoteroRAG:
             question, 
             candidates, 
             rerank_threshold,
-            progress_callback=rerank_callback
+            progress_callback=rerank_callback,
+            query_variations=question_variations
         )
         
         # Update debug info with rerank results
@@ -343,14 +382,22 @@ class ZoteroRAG:
             return []
         
         # Stage 3: Extract answers (QA Model)
-        color = self.get_query_color(question)
+        # Use provided color or get a query-based color
+        if highlight_color is None:
+            color = self.get_query_color(question)
+        else:
+            color = highlight_color
+        
         answers = self.qa_engine.extract_answers(
             question,
             reranked,
             self.indexer.paragraphs,
             qa_score_threshold=qa_score_threshold,
             color=color,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            question_variations=question_variations,
+            question_type=question_type,
+            custom_config=custom_config
         )
         
         return answers

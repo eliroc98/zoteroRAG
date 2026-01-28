@@ -174,7 +174,7 @@ def show_setup_tab():
     
     # GROBID Configuration
     st.subheader("2️⃣ GROBID Service (Optional)")
-    st.info("🔧 GROBID is used for advanced PDF parsing with sentence-level extraction. Leave default if not running.")
+    st.info("🔧 GROBID is used for advanced PDF parsing with sentence-level extraction. Make sure it runs if new pdf have to be processed.")
     
     grobid_url = st.text_input(
         "GROBID Service URL",
@@ -401,80 +401,335 @@ def show_setup_tab():
         st.rerun()
 
 
+def _format_time(seconds: float) -> str:
+    """Format time in seconds to human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:  # less than 1 hour
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.0f}s"
+    elif seconds < 86400:  # less than 1 day
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+    else:  # 1 day or more
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        return f"{days}d {hours}h"
+
+
 def show_search_tab():
     """Search and highlight tab."""
     
     st.header("🔍 Search Your Library")
     
-    # Search interface - split into query and 3 parameter columns
-    col_query, col_retrieval, col_rerank, col_qa = st.columns([3, 1, 1, 1])
+    # Question type presets
+    QUESTION_TYPE_PRESETS = {
+        'factoid': {
+            'emoji': '📌',
+            'description': 'Specific facts or entities',
+            'qa_score_threshold': 0.10,
+            'retrieval_threshold': 2.0,
+            'rerank_threshold': 0.25,
+            'max_answer_length': 50,
+            'min_answer_words': 2,
+            'prefer_entities': True
+        },
+        'explanation': {
+            'emoji': '💭',
+            'description': 'How/why something works',
+            'qa_score_threshold': 0.05,
+            'retrieval_threshold': 2.5,
+            'rerank_threshold': 0.20,
+            'max_answer_length': 200,
+            'min_answer_words': 3,
+            'prefer_entities': False
+        },
+        'methodology': {
+            'emoji': '⚙️',
+            'description': 'Processes, methods, algorithms',
+            'qa_score_threshold': 0.05,
+            'retrieval_threshold': 2.5,
+            'rerank_threshold': 0.20,
+            'max_answer_length': 250,
+            'min_answer_words': 5,
+            'prefer_entities': False,
+            'section_diversity': True,
+            'priority_sections': ['abstract', 'introduction', 'methodology', 'methods', 
+                                 'approach', 'algorithm', 'implementation']
+        },
+        'comparison': {
+            'emoji': '⚖️',
+            'description': 'Contrasting different concepts',
+            'qa_score_threshold': 0.08,
+            'retrieval_threshold': 2.0,
+            'rerank_threshold': 0.25,
+            'max_answer_length': 150,
+            'min_answer_words': 3,
+            'prefer_diversity': True
+        },
+        'definition': {
+            'emoji': '📖',
+            'description': 'What something is',
+            'qa_score_threshold': 0.10,
+            'retrieval_threshold': 2.0,
+            'rerank_threshold': 0.25,
+            'max_answer_length': 100,
+            'min_answer_words': 3,
+            'prefer_entities': False
+        },
+        'general': {
+            'emoji': '❓',
+            'description': 'General questions',
+            'qa_score_threshold': 0.10,
+            'retrieval_threshold': 2.0,
+            'rerank_threshold': 0.25,
+            'max_answer_length': 150,
+            'min_answer_words': 3,
+            'prefer_entities': False
+        },
+        'custom': {
+            'emoji': '🎛️',
+            'description': 'Custom settings (fully configurable)',
+            'qa_score_threshold': 0.0,
+            'retrieval_threshold': 2.0,
+            'rerank_threshold': 0.25,
+            'max_answer_length': 150,
+            'min_answer_words': 3,
+            'prefer_entities': False
+        }
+    }
     
-    with col_query:
-        query = st.text_input(
-            "Enter your question",
-            placeholder="What are the main findings about...",
-            key="search_input"
-        )
-        
+    # Initialize session state for presets if not exists
+    if 'selected_question_type' not in st.session_state:
+        st.session_state.selected_question_type = 'general'
+    
+    # Query input (moved to top)
+    query = st.text_input(
+        "Enter your question",
+        placeholder="What are the main findings about...",
+        key="search_input"
+    )
+    
+    st.markdown("---")
+    
+    # Question type selector
+    st.subheader("Question Type")
+    
+    question_type_options = list(QUESTION_TYPE_PRESETS.keys())
+    question_type_labels = [
+        f"{QUESTION_TYPE_PRESETS[qt]['emoji']} {qt.title()} - {QUESTION_TYPE_PRESETS[qt]['description']}"
+        for qt in question_type_options
+    ]
+    
+    selected_idx = question_type_options.index(st.session_state.selected_question_type)
+    selected_label = st.selectbox(
+        "Select question type to apply preset parameters",
+        question_type_labels,
+        index=selected_idx,
+        key="question_type_selector"
+    )
+    
+    # Extract question type from label
+    selected_question_type = question_type_options[question_type_labels.index(selected_label)]
+    st.session_state.selected_question_type = selected_question_type
+    
+    preset = QUESTION_TYPE_PRESETS[selected_question_type]
+    
+    st.markdown("---")
+    
+    # Always show configurable parameters (pre-filled with preset values)
+    st.subheader("Adjust Parameters (optional)")
+    col_retrieval, col_rerank, col_qa = st.columns(3)
+    
     with col_retrieval:
         retrieval_threshold = st.number_input(
-            "1. Retrieval Dist.",
-            min_value=0.1, max_value=10.0, value=2.0, step=0.1,
+            "1. Retrieval Distance",
+            min_value=0.1, max_value=10.0, 
+            value=preset['retrieval_threshold'], 
+            step=0.1,
             help="Stage 1 (FAISS): Higher = more paragraphs retrieved."
         )
 
     with col_rerank:
         rerank_threshold = st.number_input(
-            "2. Rerank Thresh.",
-            min_value=0.0, max_value=1.0, value=0.25, step=0.05,
-            help="Stage 2 (CrossEncoder): Minimum semantic similarity score (0.0-1.0). "
-                 "Auto-adapts based on score distribution: more selective for clear winners, "
-                 "more lenient when scores are uniformly low."
+            "2. Rerank Threshold",
+            min_value=0.0, max_value=1.0, 
+            value=preset['rerank_threshold'], 
+            step=0.05,
+            help="Stage 2 (CrossEncoder): Minimum semantic similarity score (0.0-1.0)."
         )
 
     with col_qa:
         qa_score_threshold = st.number_input(
-            "3. QA Conf.",
-            min_value=0.0, max_value=1.0, value=0.0, step=0.1,
-            help="Stage 3 (QA Model): Base confidence threshold. "
-                 "Auto-adapts by question type: "
-                 "Factoid (0.10), Explanation (0.05), Comparison (0.08), Definition (0.10)."
+            "3. QA Confidence",
+            min_value=0.0, max_value=1.0, 
+            value=preset['qa_score_threshold'], 
+            step=0.05,
+            help="Stage 3 (QA Model): Confidence threshold."
         )
     
-    # Add explanation about question types
-    with st.expander("ℹ️ How Question Type Detection Works"):
-        st.markdown("""
-        The system automatically detects your question type and optimizes parameters:
+    col_min_words, col_max_length, col_paraphrases = st.columns(3)
+    with col_min_words:
+        min_answer_words = st.number_input(
+            "Min Answer Words",
+            min_value=1, max_value=20, 
+            value=preset['min_answer_words'], 
+            step=1,
+            help="Minimum words in an answer."
+        )
+    
+    with col_max_length:
+        max_answer_length = st.number_input(
+            "Max Answer Length",
+            min_value=10, max_value=500, 
+            value=preset['max_answer_length'], 
+            step=10,
+            help="Maximum words in an answer."
+        )
+    
+    with col_paraphrases:
+        num_paraphrases = st.number_input(
+            "Question Paraphrases",
+            min_value=0, max_value=10, 
+            value=2, 
+            step=1,
+            help="Number of question paraphrases to generate (0 = disabled, uses only original question)."
+        )
+    
+    # Build custom config if user modified any values from preset
+    if (qa_score_threshold != preset['qa_score_threshold'] or
+        max_answer_length != preset['max_answer_length'] or
+        min_answer_words != preset['min_answer_words']):
+        custom_config = {
+            'qa_score_threshold': qa_score_threshold,
+            'max_answer_length': max_answer_length,
+            'min_answer_words': min_answer_words,
+            'prefer_entities': False
+        }
+    else:
+        custom_config = None
+    
+    # Predefined color presets (defined here for use in search)
+    COLOR_PRESETS = {
+        'Yellow': (1.0, 1.0, 0.0),
+        'Cyan': (0.0, 1.0, 1.0),
+        'Orange': (1.0, 0.5, 0.0),
+        'Green': (0.5, 1.0, 0.5),
+        'Pink': (1.0, 0.7, 0.8),
+        'Purple': (0.7, 0.5, 1.0),
+        'Custom': None  # Will be set via RGB picker
+    }
+    
+    # Initialize session state for color
+    if 'highlight_color_preset' not in st.session_state:
+        st.session_state.highlight_color_preset = 'Yellow'
+    if 'highlight_color_custom' not in st.session_state:
+        st.session_state.highlight_color_custom = (1.0, 1.0, 0.0)
+    
+    st.markdown("---")
+    
+    # Paraphrase management UI
+    if num_paraphrases > 0 and query:
+        st.subheader("📝 Question Paraphrases")
         
-        **📌 Factoid** (Who/What/When/Where)
-        - Examples: "Who invented the transformer?", "When was BERT released?"
-        - QA Threshold: 0.10 (more lenient for specific facts)
-        - Answer Length: Up to 50 words (short & precise)
+        # Initialize session state for paraphrases
+        if 'paraphrase_candidates' not in st.session_state:
+            st.session_state.paraphrase_candidates = []
+        if 'paraphrase_selected' not in st.session_state:
+            st.session_state.paraphrase_selected = set()
+        if 'paraphrase_query' not in st.session_state:
+            st.session_state.paraphrase_query = None
         
-        **💭 Explanation** (How/Why/Explain)
-        - Examples: "How does self-attention work?", "Why is BERT effective?"
-        - QA Threshold: 0.05 (very lenient for complex answers)
-        - Answer Length: Up to 200 words (detailed explanations)
-        - Context: Adds previous + next paragraphs for more context
+        # Generate paraphrases button
+        col_gen, col_more = st.columns([1, 1])
         
-        **⚖️ Comparison** (Compare/Difference/Versus)
-        - Examples: "Compare BERT and GPT", "Difference between attention mechanisms"
-        - QA Threshold: 0.08
-        - Answer Length: Up to 150 words
-        - Context: Expanded to capture multiple perspectives
+        with col_gen:
+            if st.button("🔄 Generate Paraphrases", use_container_width=True):
+                if st.session_state.rag and st.session_state.rag.qa_engine.paraphraser:
+                    with st.spinner("Generating paraphrases..."):
+                        variations = st.session_state.rag.qa_engine.expand_question(
+                            query, 
+                            num_variations=num_paraphrases * 2  # Generate more for selection
+                        )
+                        # Store candidates (excluding original)
+                        st.session_state.paraphrase_candidates = variations[1:]
+                        st.session_state.paraphrase_query = query
+                        # Auto-select first N paraphrases
+                        st.session_state.paraphrase_selected = set(range(min(num_paraphrases, len(variations) - 1)))
+                        st.rerun()
+                else:
+                    st.error("Paraphraser not available. Question expansion is disabled.")
         
-        **📖 Definition** (Define/What is)
-        - Examples: "What is a transformer?", "Define attention mechanism"
-        - QA Threshold: 0.10
-        - Answer Length: Up to 100 words
+        with col_more:
+            if st.session_state.paraphrase_candidates and st.button("➕ Generate More", use_container_width=True):
+                if st.session_state.rag and st.session_state.rag.qa_engine.paraphraser:
+                    with st.spinner("Generating more paraphrases..."):
+                        # Generate additional paraphrases
+                        more_variations = st.session_state.rag.qa_engine.expand_question(
+                            query, 
+                            num_variations=num_paraphrases
+                        )
+                        # Add new ones to existing (avoid duplicates)
+                        existing_set = set(st.session_state.paraphrase_candidates)
+                        for var in more_variations[1:]:
+                            if var not in existing_set:
+                                st.session_state.paraphrase_candidates.append(var)
+                                existing_set.add(var)
+                        st.rerun()
         
-        **❓ General** (Everything else)
-        - QA Threshold: Uses your base setting
-        - Answer Length: Up to 150 words
+        # Show original question
+        st.markdown("**Original Question (always included):**")
+        st.info(f"✓ {query}")
         
-        *Note: The system will automatically adjust these thresholds from your base setting.*
-        """)
-
+        # Show and allow selection/editing of paraphrases
+        if st.session_state.paraphrase_candidates and st.session_state.paraphrase_query == query:
+            st.markdown(f"**Generated Paraphrases** ({len(st.session_state.paraphrase_candidates)} available):")
+            st.markdown("*Select which paraphrases to use and edit them if needed:*")
+            
+            # Track which ones to keep
+            selected_indices = set()
+            edited_paraphrases = {}
+            
+            for i, paraphrase in enumerate(st.session_state.paraphrase_candidates):
+                col_check, col_edit = st.columns([0.1, 0.9])
+                
+                with col_check:
+                    is_selected = st.checkbox(
+                        "✓",
+                        value=i in st.session_state.paraphrase_selected,
+                        key=f"para_check_{i}",
+                        label_visibility="collapsed"
+                    )
+                    if is_selected:
+                        selected_indices.add(i)
+                
+                with col_edit:
+                    edited = st.text_input(
+                        f"Paraphrase {i+1}",
+                        value=paraphrase,
+                        key=f"para_edit_{i}",
+                        label_visibility="collapsed",
+                        disabled=not is_selected
+                    )
+                    if is_selected and edited != paraphrase:
+                        edited_paraphrases[i] = edited
+            
+            # Update session state
+            st.session_state.paraphrase_selected = selected_indices
+            
+            # Apply edits
+            for i, new_text in edited_paraphrases.items():
+                st.session_state.paraphrase_candidates[i] = new_text
+            
+            st.markdown(f"**Selected:** {len(selected_indices)} paraphrase(s) + original question")
+        elif not st.session_state.paraphrase_candidates:
+            st.info("👆 Click 'Generate Paraphrases' to create question variations")
+        elif st.session_state.paraphrase_query != query:
+            st.warning("⚠️ Question changed. Click 'Generate Paraphrases' to update.")
+    
+    st.markdown("---")
     col_search, col_clear = st.columns([1, 4])
     with col_search:
         search_clicked = st.button("Search", type="primary", use_container_width=True)
@@ -513,9 +768,9 @@ def show_search_tab():
                 if current > 0 and progress < 1.0:
                     estimated_total = elapsed / progress
                     remaining = estimated_total - elapsed
-                    time_info = f"⏱️ Elapsed: {elapsed:.1f}s | Remaining: ~{remaining:.1f}s"
+                    time_info = f"⏱️ Elapsed: {_format_time(elapsed)} | Remaining: ~{_format_time(remaining)}"
                 elif progress >= 1.0:
-                    time_info = f"⏱️ Completed in {elapsed:.1f}s"
+                    time_info = f"⏱️ Completed in {_format_time(elapsed)}"
                 else:
                     time_info = ""
             else:
@@ -537,9 +792,9 @@ def show_search_tab():
                 if current > 0 and progress < 1.0:
                     estimated_total = elapsed / progress
                     remaining = estimated_total - elapsed
-                    time_info = f"⏱️ Elapsed: {elapsed:.1f}s | Remaining: ~{remaining:.1f}s"
+                    time_info = f"⏱️ Elapsed: {_format_time(elapsed)} | Remaining: ~{_format_time(remaining)}"
                 elif progress >= 1.0:
-                    time_info = f"⏱️ Completed in {elapsed:.1f}s"
+                    time_info = f"⏱️ Completed in {_format_time(elapsed)}"
                 else:
                     time_info = ""
             else:
@@ -549,13 +804,37 @@ def show_search_tab():
             qa_status.text(f"🤖 Stage 2 - QA Extraction: {message} {time_info}")
         
         try:
+            # Get highlight color from session state
+            color_preset = st.session_state.get('highlight_color_preset', 'Yellow')
+            if color_preset == 'Custom':
+                highlight_color = st.session_state.get('highlight_color_custom', (1.0, 1.0, 0.0))
+            else:
+                highlight_color = COLOR_PRESETS[color_preset]
+            
+            # Prepare selected paraphrases (if any)
+            selected_paraphrases = None
+            if (num_paraphrases > 0 and 
+                st.session_state.get('paraphrase_candidates') and 
+                st.session_state.get('paraphrase_query') == query):
+                # Get selected paraphrases
+                selected_paraphrases = [query]  # Always include original
+                for i in sorted(st.session_state.paraphrase_selected):
+                    if i < len(st.session_state.paraphrase_candidates):
+                        selected_paraphrases.append(st.session_state.paraphrase_candidates[i])
+            
+            # Pass the selected question type, custom config, color, and paraphrases
             st.session_state.search_results = st.session_state.rag.answer_question(
                 question=query,
                 retrieval_threshold=retrieval_threshold,
                 qa_score_threshold=qa_score_threshold,
                 rerank_threshold=rerank_threshold,
                 progress_callback=qa_callback,
-                rerank_callback=rerank_callback
+                rerank_callback=rerank_callback,
+                question_type=selected_question_type,
+                custom_config=custom_config,
+                num_paraphrases=num_paraphrases,
+                highlight_color=highlight_color,
+                question_variations=selected_paraphrases
             )
             
             # Mark completion
@@ -568,10 +847,9 @@ def show_search_tab():
             st.session_state.current_index = 0
             st.session_state.current_query = query
             
-            # Classify and store question type for display
-            question_type = st.session_state.rag.qa_engine.classify_question_type(query)
-            st.session_state.current_question_type = question_type
-            st.session_state.qa_score_threshold = qa_score_threshold  # Store base threshold
+            # Store question type for display
+            st.session_state.current_question_type = selected_question_type
+            st.session_state.qa_score_threshold = qa_score_threshold  # Store threshold
         except Exception as e:
             st.error(f"❌ Search failed: {e}")
             st.session_state.search_results = []
@@ -587,48 +865,19 @@ def show_search_tab():
     # Display results
     if st.session_state.search_results:
         # Get question type info
-        question_type = st.session_state.get('current_question_type', 'unknown')
-        question_type_emoji = {
-            'factoid': '📌',
-            'explanation': '💭', 
-            'comparison': '⚖️',
-            'definition': '📖',
-            'general': '❓'
-        }.get(question_type, '❓')
+        question_type = st.session_state.get('current_question_type', 'general')
+        preset = QUESTION_TYPE_PRESETS.get(question_type, QUESTION_TYPE_PRESETS['general'])
+        question_type_emoji = preset['emoji']
         
-        # Get the adaptive configuration for this question type
+        # Get the configuration for this question type
         qa_threshold_used = st.session_state.get('qa_score_threshold', 0.0)
-        config = st.session_state.rag.qa_engine.adjust_thresholds_by_type(question_type, qa_threshold_used)
+        config = st.session_state.rag.qa_engine.get_config_for_type(question_type, qa_threshold_used)
         
         st.success(f"✅ Found {len(st.session_state.search_results)} answers for: *{st.session_state.current_query}*")
         
-        # Show question type with detailed threshold info in a single merged display
-        # Add special notes based on question type
-        notes = {
-            'factoid': '→ Optimized for short, precise answers',
-            'explanation': '→ Very lenient threshold, allows longer detailed answers',
-            'comparison': '→ Seeks diverse perspectives',
-            'definition': '→ Balanced threshold for informative answers',
-            'general': '→ Standard parameters'
-        }
-        
-        # Build combined info display
-        combined_info = f"""
-        {question_type_emoji} **Question Type:** {question_type.title()}
-        
-        **Adaptive Parameters Applied:**
-        - QA Confidence: {config['qa_score_threshold']:.3f} (base: {qa_threshold_used:.3f})
-        - Max Answer Length: {config['max_answer_length']} words
-        - Min Answer Words: {config['min_answer_words']} words
-        
-        {notes.get(question_type, '')}
-        """
-        
-        st.info(combined_info)
-        
         # Navigation and actions
         st.markdown("---")
-        col1, col2, col3, col4, col5 = st.columns([1, 2, 1, 1, 1])
+        col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 2])
         
         with col1:
             if st.button("⬅️ Previous"):
@@ -661,7 +910,10 @@ def show_search_tab():
                     st.error(f"Could not open PDF: {e}")
         
         with col5:
-            if st.button("💾 Highlight All"):
+            pass  # Empty column for spacing
+        
+        with col6:
+            if st.button("💾 Highlight All", use_container_width=True):
                 # Answers already have the highlighting info
                 coll_name = st.session_state.rag.collection_name or "All_Library"
                 output_dir = os.path.join(st.session_state.output_dir, coll_name, "highlighted")
@@ -675,6 +927,7 @@ def show_search_tab():
                     pdfs_answers[answer.pdf_path].append(answer)
                 
                 highlighted_paths = []
+                failed_pdfs = []
                 progress_bar = st.progress(0)
                 
                 for idx, (pdf_path, answers) in enumerate(pdfs_answers.items()):
@@ -686,19 +939,63 @@ def show_search_tab():
                     result_path = st.session_state.rag.highlight_pdf(answers, output_path)
                     if result_path:
                         highlighted_paths.append(result_path)
+                    else:
+                        failed_pdfs.append(original_filename)
                     
                     progress_bar.progress((idx + 1) / len(pdfs_answers))
                 
                 progress_bar.empty()
                 
+                if failed_pdfs:
+                    st.error(f"❌ Failed to highlight {len(failed_pdfs)} PDF(s)")
+                    with st.expander("Show failed PDFs"):
+                        for pdf_name in failed_pdfs:
+                            st.text(f"📄 {pdf_name}")
+                
                 if highlighted_paths:
-                    st.success(f"✅ Created {len(highlighted_paths)} highlighted PDF(s)")
-                    with st.expander("Show files"):
+                    st.success(f"✅ Successfully highlighted {len(highlighted_paths)} PDF(s)")
+                    with st.expander("Show highlighted files"):
                         for path in highlighted_paths:
                             st.text(f"📄 {os.path.basename(path)}")
                         st.text(f"📁 Location: {output_dir}")
-                else:
-                    st.error("Failed to create highlighted PDFs")
+        
+        # Color selection for next search/highlights
+        st.markdown("---")
+        st.subheader("🎨 Highlight Color (for next search)")
+        
+        col_preset, col_rgb = st.columns([1, 2])
+        
+        with col_preset:
+            color_preset = st.selectbox(
+                "Color Preset",
+                options=list(COLOR_PRESETS.keys()),
+                index=list(COLOR_PRESETS.keys()).index(st.session_state.highlight_color_preset),
+                help="Choose a predefined color or select 'Custom' to use RGB picker",
+                key="color_preset_results"
+            )
+            st.session_state.highlight_color_preset = color_preset
+        
+        with col_rgb:
+            if color_preset == 'Custom':
+                # Show RGB sliders for custom color
+                col_r, col_g, col_b = st.columns(3)
+                with col_r:
+                    r = st.slider("R", 0.0, 1.0, st.session_state.highlight_color_custom[0], 0.05, key="r_results")
+                with col_g:
+                    g = st.slider("G", 0.0, 1.0, st.session_state.highlight_color_custom[1], 0.05, key="g_results")
+                with col_b:
+                    b = st.slider("B", 0.0, 1.0, st.session_state.highlight_color_custom[2], 0.05, key="b_results")
+                highlight_color_next = (r, g, b)
+                st.session_state.highlight_color_custom = highlight_color_next
+            else:
+                highlight_color_next = COLOR_PRESETS[color_preset]
+            
+            # Show color preview
+            color_hex_next = rgb_to_hex(highlight_color_next)
+            st.markdown(
+                f"**Preview:** <span style='background-color: {color_hex_next}; padding: 5px 20px; border: 1px solid #ccc;'>&nbsp;&nbsp;&nbsp;&nbsp;</span>",
+                unsafe_allow_html=True
+            )
         
         # Current result display
         st.markdown("---")
@@ -748,7 +1045,7 @@ def show_search_tab():
         - Increase Retrieval Threshold to 3.0 or higher
         - Rephrase as a specific question (e.g., "What is X?" instead of "Tell me about X")
         """)
-    elif not query:
+    elif not query and search_clicked:
         st.info("👆 Enter a question above and click Search to get started")
     
     # Footer
