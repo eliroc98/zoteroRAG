@@ -1,6 +1,6 @@
 # 📚 Zotero RAG Navigator
 
-A sophisticated question-answering system for your local Zotero library featuring a multi-stage RAG pipeline with GROBID parsing, semantic search, reranking, and extractive QA. Generate precise answers from your research papers with automatic highlighting and question expansion.
+A question-answering system for your local Zotero library featuring a multi-stage RAG pipeline with GROBID parsing, semantic search, reranking, and extractive QA. Generate precise answers from your research papers with automatic highlighting and question expansion.
 
 ## Features
 
