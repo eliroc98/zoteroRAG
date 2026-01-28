@@ -367,51 +367,35 @@ def show_search_tab():
     
     st.markdown("---")
     
-    # Search interface - all in one row
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col1:
+    # Search interface - split into query and 3 parameter columns
+    col_query, col_retrieval, col_rerank, col_qa = st.columns([3, 1, 1, 1])
+    
+    with col_query:
         query = st.text_input(
             "Enter your question",
             placeholder="What are the main findings about...",
             key="search_input"
         )
-    with col2:
+        
+    with col_retrieval:
         retrieval_threshold = st.number_input(
-            "Retrieval Threshold",
-            min_value=0.1,
-            max_value=10.0,
-            value=0.9,
-            step=0.1,
-            help="""Stage 1: Semantic Search - Retrieves paragraphs within this L2 distance from your question.
-            
-• Lower distance = better semantic match (paragraphs ranked by distance)
-• Default: 2.0 | Range: 0.1 (strict) to 10.0 (permissive)
-
-How to tune:
-• Too few candidates (< 50)? → Increase to 3.0-5.0
-• Too many irrelevant (> 1000)? → Decrease to 1.0-1.5
-• Check debug view to see retrieval scores
-
-Presets: Exploratory=3.0-5.0 | Balanced=2.0 | Precise=1.0-1.5"""
+            "1. Retrieval Dist.",
+            min_value=0.1, max_value=10.0, value=2.0, step=0.1,
+            help="Stage 1 (FAISS): Higher = more paragraphs retrieved."
         )
-    with col3:
+
+    with col_rerank:
+        rerank_threshold = st.number_input(
+            "2. Rerank Thresh.",
+            min_value=0.0, max_value=1.0, value=0.25, step=0.05,
+            help="Stage 2 (CrossEncoder): Minimum semantic similarity score (0.0-1.0) to keep a paragraph."
+        )
+
+    with col_qa:
         qa_score_threshold = st.number_input(
-            "QA Score Threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.5,
-            step=0.1,
-            help="""Stage 2: Answer Extraction - Filters answers by QA model confidence.
-
-• Default: 0.0 (keep all) | Range: 0.0 to 1.0
-• Good answers typically score 0.1-0.9
-
-How to tune:
-1. Run search with 0.0 to see all answers
-2. Check confidence scores in results
-3. Set threshold just below good answers
-
-Presets: Exploratory=0.0 | Balanced=0.1-0.2 | Quality=0.3-0.5 | Strict=0.7+"""
+            "3. QA Conf.",
+            min_value=0.0, max_value=1.0, value=0.0, step=0.1,
+            help="Stage 3 (QA Model): Minimum answer confidence."
         )
 
     col_search, col_clear = st.columns([1, 4])
@@ -428,8 +412,12 @@ Presets: Exploratory=0.0 | Balanced=0.1-0.2 | Quality=0.3-0.5 | Strict=0.7+"""
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        def progress_callback(current, total, message):
-            progress = current / total if total > 0 else 0
+        # Generic callback for both stages to update the same UI element
+        def ui_callback(current, total, message):
+            if total > 0:
+                progress = current / total
+            else:
+                progress = 0
             progress_bar.progress(progress)
             status_text.text(message)
         
@@ -438,7 +426,9 @@ Presets: Exploratory=0.0 | Balanced=0.1-0.2 | Quality=0.3-0.5 | Strict=0.7+"""
                 question=query,
                 retrieval_threshold=retrieval_threshold,
                 qa_score_threshold=qa_score_threshold,
-                progress_callback=progress_callback
+                rerank_threshold=rerank_threshold,  # New threshold
+                progress_callback=ui_callback,      # QA callback
+                rerank_callback=ui_callback         # CrossEncoder callback
             )
             progress_bar.progress(1.0)
             status_text.text("✓ Complete!")
@@ -451,7 +441,6 @@ Presets: Exploratory=0.0 | Balanced=0.1-0.2 | Quality=0.3-0.5 | Strict=0.7+"""
             with st.expander("Show full error"):
                 st.exception(e)
         finally:
-            # Clean up progress indicators after a brief delay
             import time
             time.sleep(0.5)
             progress_bar.empty()

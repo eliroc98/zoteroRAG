@@ -793,118 +793,153 @@ class ZoteroRAG:
         
         return len(self.paragraphs)
 
-    def answer_question(self, question: str, retrieval_threshold: float = 2.0, qa_score_threshold: float = 0.0, progress_callback=None) -> List[Answer]:
-        """Answer a question using QA pipeline.
-        
-        Pipeline:
-        1. Retrieve relevant paragraphs (semantic search)
-        2. Rank paragraphs by similarity score (lower L2 distance = better)
-        3. Extract answers (QA model)
-        4. Filter by QA confidence threshold
-        
-        Args:
-            question: The question to answer
-            retrieval_threshold: FAISS L2 distance threshold (higher = more candidates)
-            qa_score_threshold: Minimum QA confidence score to return (default 0.0)
-                               Only answers with score >= threshold will be returned
-            progress_callback: Function that accepts (current, total, message)
-        
-        Returns:
-            List of Answer objects sorted by confidence (highest first)
+    def answer_question(self, question: str, retrieval_threshold: float = 2.0, 
+                        qa_score_threshold: float = 0.0, rerank_threshold: float = 0.25, 
+                        progress_callback=None, rerank_callback=None) -> List[Answer]:
+        """
+        Answer a question using:
+        1. FAISS Retrieval (Range Search)
+        2. CrossEncoder Reranking (Threshold Filtering)
+        3. QA Extraction (with Context Overlap/Sliding Window)
         """
         if not self.index: 
             raise ValueError("Index is not built.")
         
-        # Stage 1: Retrieve candidate paragraphs with semantic search
-        
+        # --- Stage 1: Retrieve candidate paragraphs (FAISS) ---
         query_embedding = self.model.encode([question], show_progress_bar=False)
+        
+        # Use range_search to get initial candidates
         lims, D, I = self.index.range_search(np.array(query_embedding).astype('float32'), retrieval_threshold)
         indices, distances = I[lims[0]:lims[1]], D[lims[0]:lims[1]]
         
         logger.debug(f"Question: {question}")
         logger.debug(f"Retrieved {len(indices)} paragraphs within L2 distance {retrieval_threshold}")
         
-        candidate_paragraphs = []
+        candidate_data = []
         color = self.get_query_color(question)
         debug_candidates = []
         
+        # Store tuple of (Paragraph, faiss_dist, ORIGINAL_INDEX)
         for idx, dist in zip(indices, distances):
             paragraph = self.paragraphs[idx]
-            # No keyword filtering
-            candidate_paragraphs.append((paragraph, float(dist)))
+            candidate_data.append((paragraph, float(dist), idx))
             debug_candidates.append({
                 'paragraph': paragraph,
                 'retrieval_score': float(dist),
                 'kept': True
             })
         
-        logger.debug(f"{len(candidate_paragraphs)} paragraphs passed keyword filter")
-        
-        if not candidate_paragraphs:
+        if not candidate_data:
             self.last_candidates = []
             return []
         
-        pairs = [[question, p[0].text] for p in candidate_paragraphs]
-        scores = self.reranker.predict(pairs)
-        candidate_paragraphs = [x for _, x in sorted(zip(scores, candidate_paragraphs), key=lambda pair: pair[0], reverse=True)]
-        logger.debug(f"Sorted {len(candidate_paragraphs)} paragraphs by retrieval score")
+        # --- Stage 2: Rerank and Filter (CrossEncoder) ---
         
-        # Save debug candidates for UI inspection
+        # ** CALLBACK START: Pre-Rerank **
+        if rerank_callback:
+            rerank_callback(0, len(candidate_data), f"Cross-Encoding {len(candidate_data)} candidates...")
+        
+        # Prepare pairs for the reranker
+        pairs = [[question, p[0].text] for p in candidate_data]
+        
+        # Predict scores
+        raw_scores = self.reranker.predict(pairs)
+        
+        # Apply Sigmoid to convert logits to 0-1 probabilities
+        probs = 1 / (1 + np.exp(-raw_scores))
+        
+        # Combine probabilities with candidate data
+        scored_candidates = list(zip(probs, candidate_data))
+        
+        # FILTER: Keep only candidates above the rerank_threshold
+        filtered_candidates = [
+            (prob, item) for prob, item in scored_candidates 
+            if prob >= rerank_threshold
+        ]
+        
+        # SORT: By probability descending
+        filtered_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Unpack back to simple list for QA loop: (paragraph, faiss_dist, original_idx)
+        candidate_data = [item[1] for item in filtered_candidates]
+        
+        # ** CALLBACK END: Post-Rerank **
+        if rerank_callback:
+            rerank_callback(len(candidate_data), len(candidate_data), f"Reranking complete: {len(candidate_data)} paragraphs passed threshold.")
+
+        logger.debug(f"Reranking: {len(scored_candidates)} -> {len(candidate_data)} paragraphs passed threshold {rerank_threshold}")
+
+        # Update debug info
         self.last_candidates = [
             {
                 'paragraph': d['paragraph'],
                 'retrieval_score': d['retrieval_score'],
-                'kept': d['kept'],
+                'kept': d['paragraph'].text in [c[0].text for c in candidate_data],
             }
             for d in debug_candidates
         ]
 
-        # Stage 3: Extract answers with QA model
+        # --- Stage 3: Extract answers (QA Model + Sliding Window) ---
         qa_pipe = self._load_qa_pipeline()
-        
         answers = []
         
         if qa_pipe:
-            logger.debug(f"QA model available, extracting answers from {len(candidate_paragraphs)} paragraphs")
+            logger.debug(f"QA model available, extracting answers from {len(candidate_data)} paragraphs")
             try:
-                for i, (paragraph, retrieval_score) in enumerate(candidate_paragraphs):
-                    # Update progress for each paragraph processed
+                for i, (paragraph, retrieval_score, original_idx) in enumerate(candidate_data):
                     if progress_callback:
-                        progress_callback(i, len(candidate_paragraphs), f"Analyzing paragraph {i+1}/{len(candidate_paragraphs)}")
+                        progress_callback(i, len(candidate_data), f"QA Analysis: Paragraph {i+1}/{len(candidate_data)}")
                     
-                    # Build QA input
-                    QA_input = {
-                        'question': question,
-                        'context': paragraph.text
-                    }
+                    # --- CONTEXT OVERLAP LOGIC ---
+                    prev_paragraph = None
+                    combined_text = paragraph.text
+                    shift_offset = 0
                     
-                    # Get answer from QA model
+                    if original_idx > 0:
+                        potential_prev = self.paragraphs[original_idx - 1]
+                        if potential_prev.pdf_path == paragraph.pdf_path:
+                            prev_paragraph = potential_prev
+                            combined_text = prev_paragraph.text + " " + paragraph.text
+                            shift_offset = len(prev_paragraph.text) + 1
+                    
+                    QA_input = {'question': question, 'context': combined_text}
                     result = qa_pipe(**QA_input)
                     
                     if result:
-                        # Expand answer to include full sentence(s) and get coordinates
                         if len(result['answer'].split()) < 3: 
                             continue 
+                        
                         raw_answer = result['answer']
                         raw_start = result.get('start', 0)
                         raw_end = result.get('end', len(raw_answer))
                         
-                        expanded_text, new_start, new_end, sentence_coords = self._expand_to_sentences(
-                            paragraph, raw_start, raw_end
-                        )
+                        target_paragraph = paragraph
+                        local_start = raw_start
+                        local_end = raw_end
                         
-                        logger.debug(f"Answer {i+1}: '{expanded_text}' (score: {result.get('score', 0.0):.4f})")
-                        logger.debug(f"  Original: '{raw_answer}'")
-                        logger.debug(f"  Sentence coords: {len(sentence_coords)} sentences")
+                        if prev_paragraph and raw_end <= shift_offset:
+                            target_paragraph = prev_paragraph
+                        elif prev_paragraph and raw_start >= shift_offset:
+                            target_paragraph = paragraph
+                            local_start = raw_start - shift_offset
+                            local_end = raw_end - shift_offset
+                        elif prev_paragraph:
+                            target_paragraph = paragraph
+                            local_start = max(0, raw_start - shift_offset)
+                            local_end = raw_end - shift_offset
+
+                        expanded_text, new_start, new_end, sentence_coords = self._expand_to_sentences(
+                            target_paragraph, local_start, local_end
+                        )
                         
                         answer = Answer(
                             text=expanded_text,
-                            context=paragraph.text,
-                            pdf_path=paragraph.pdf_path,
-                            page_num=paragraph.page_num,
-                            item_key=paragraph.item_key,
-                            title=paragraph.title,
-                            section=paragraph.section,
+                            context=target_paragraph.text,
+                            pdf_path=target_paragraph.pdf_path,
+                            page_num=target_paragraph.page_num,
+                            item_key=target_paragraph.item_key,
+                            title=target_paragraph.title,
+                            section=target_paragraph.section,
                             start_char=new_start,
                             end_char=new_end,
                             score=float(result.get('score', 0.0)),
@@ -914,32 +949,39 @@ class ZoteroRAG:
                             retrieval_score=retrieval_score
                         )
                         answers.append(answer)
-                    else:
-                        logger.debug(f"Answer {i+1}: No answer extracted")
                 
-                # Final progress update
                 if progress_callback:
-                    progress_callback(len(candidate_paragraphs), len(candidate_paragraphs), "Finalizing results...")
+                    progress_callback(len(candidate_data), len(candidate_data), "Finalizing results...")
                     
             except Exception as e:
                 logger.error(f"QA extraction failed: {e}", exc_info=True)
-                # If QA pipeline fails, abort so the caller can handle it
                 raise RuntimeError("QA extraction failed; aborting without fallback paragraphs")
         else:
-            # QA model not available: abort instead of returning paragraphs
             raise RuntimeError("QA pipeline not available; cannot answer question")
         
-        logger.debug(f"Total answers extracted: {len(answers)}")
-        
-        # Sort by QA confidence score (descending)
+        # Sort by score descending first
         answers.sort(key=lambda x: x.score, reverse=True)
         
-        # Filter by QA score threshold
-        filtered_answers = [a for a in answers if a.score >= qa_score_threshold]
+        # --- DEDUPLICATION ---
+        # Keep unique answers based on (pdf_path, standardized_text)
+        # This prevents the same answer appearing twice from overlapping chunks in the same PDF.
+        unique_answers = []
+        seen_answers = set()
         
-        logger.debug(f"Answers passing QA threshold {qa_score_threshold}: {len(filtered_answers)}")
+        for ans in answers:
+            if ans.score < qa_score_threshold:
+                continue
+                
+            # Create a signature for the answer
+            # We normalize text (lowercase + strip) to catch minor variations
+            norm_text = " ".join(ans.text.lower().split())
+            signature = (ans.pdf_path, norm_text)
+            
+            if signature not in seen_answers:
+                seen_answers.add(signature)
+                unique_answers.append(ans)
         
-        return filtered_answers
+        return unique_answers
 
     def highlight_pdf(self, answers_for_pdf: List[Answer], output_path: str):
         """Highlight PDF using TEI sentence coordinates for precise highlighting."""
@@ -964,9 +1006,10 @@ class ZoteroRAG:
             for page_num, answers in answers_by_page.items():
                 page = doc[page_num]
                 for answer in answers:
+                    highlighted_any = False
+
                     # Use TEI coordinates if available
                     if answer.sentence_coords:
-                        highlighted_any = False
                         for coords_str in answer.sentence_coords:
                             # Parse GROBID coords format: "page,x0,y0,width,height"
                             # Can have multiple coordinate groups separated by ';'
@@ -1009,44 +1052,13 @@ class ZoteroRAG:
                                     )
                                     annot.update()
                             except:
-                                pass
-                        else:
-                            logger.warning(f"Could not highlight using coordinates on page {page_num}")
-                    else:
-                        # Fallback: try text search (old method)
-                        logger.debug(f"No coordinates available, falling back to text search for: {answer.text[:50]}...")
-                        search_texts = [
-                            answer.text,
-                            answer.text[:200],
-                            " ".join(answer.text.split()[:20]),
-                            " ".join(answer.text.split()[:10]),
-                        ]
-                        
-                        areas = []
-                        for search_text in search_texts:
-                            if not search_text.strip():
+                                logger.warning(f"Could not annotate {answer.pdf_path}.")
                                 continue
-                            try:
-                                areas = page.search_for(search_text)
-                                if areas:
-                                    break
-                            except:
-                                pass
-                        
-                        if areas:
-                            for area in areas:
-                                highlight = page.add_highlight_annot(area)
-                                highlight.set_colors(stroke=answer.color)
-                                highlight.update()
-                            
-                            answer_preview = answer.text[:100] + "..." if len(answer.text) > 100 else answer.text
-                            annot = page.add_text_annot(
-                                areas[0].tl,
-                                f"Q: {answer.query[:80]}...\nA: {answer_preview}"
-                            )
-                            annot.update()
                         else:
-                            logger.warning(f"Could not find text to highlight on page {page_num}: {answer.text[:50]}...")
+                            logger.warning(f"Could not highlight {answer.pdf_path} using coordinates on page {page_num}.")
+
+                    if not highlighted_any:
+                        logger.warning(f"Could not highlight {answer.pdf_path} using TEI coordinates on page {page_num}: {answer.text[:50]}... Skipping fallback search.")
             
             # Use incremental save if file already exists, otherwise normal save
             incremental = os.path.exists(output_path) and source_pdf == output_path
