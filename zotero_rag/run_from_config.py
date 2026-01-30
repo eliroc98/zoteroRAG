@@ -214,8 +214,10 @@ def run_from_config(config_path: str) -> Dict[str, List[Answer]]:
                     answers_by_pdf[pdf_path] = []
                 answers_by_pdf[pdf_path].append(answer)
         
-        # Create highlighted PDFs
-        output_dir = os.path.join(config['output_base_dir'], 'highlighted_pdfs')
+        # Create highlighted PDFs in the same directory as indexes
+        # Get the index directory from the RAG system
+        index_dir = os.path.dirname(rag.index_path)
+        output_dir = index_dir
         os.makedirs(output_dir, exist_ok=True)
         
         for pdf_path, pdf_answers in answers_by_pdf.items():
@@ -239,7 +241,7 @@ def run_from_config(config_path: str) -> Dict[str, List[Answer]]:
         for question, answers in all_results.items():
             json_results[question] = [answer_to_dict(a) for a in answers]
         
-        output_path = os.path.join(config['output_base_dir'], output_file)
+        output_path = os.path.join(output_dir, output_file)
         with open(output_path, 'w') as f:
             json.dump(json_results, f, indent=2)
         
