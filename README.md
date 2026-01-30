@@ -23,27 +23,31 @@ A question-answering system for your local Zotero library featuring a multi-stag
 ## Project Structure
 
 ```
-literature/
-├── app.py                    # Streamlit web interface
-├── zotero_rag.py            # Main orchestration class
-├── zotero_db.py             # Zotero SQLite database interface
-├── pdf_processor.py         # GROBID client and TEI parsing
-├── indexer.py               # FAISS indexing and retrieval
-├── reranker.py              # CrossEncoder reranking
-├── qa_engine.py             # Extractive QA with question expansion
-├── highlighter.py           # PDF annotation using coordinates
-├── models.py                # Data classes (Paragraph, Answer)
+.
+├── zotero_rag/              # Main package
+│   ├── app.py               # Streamlit web interface
+│   ├── zotero_rag.py        # Main orchestration class
+│   ├── zotero_db.py         # Zotero SQLite database interface
+│   ├── pdf_processor.py     # GROBID client and TEI parsing
+│   ├── indexer.py           # FAISS indexing and retrieval
+│   ├── reranker.py          # CrossEncoder reranking
+│   ├── qa_engine.py         # Extractive QA with question expansion
+│   ├── highlighter.py       # PDF annotation using coordinates
+│   └── models.py            # Data classes (Paragraph, Answer)
+│
 ├── pyproject.toml           # Poetry dependencies
-└── README.md                # This file
+├── README.md                # This file
+├── LICENSE                  # GPL v3.0 license
+└── test_new_features.py     # Feature tests
 
-literature_output/
+output/                     # Output directory (indexes, cache, highlighted PDFs)
 ├── {collection}/
-│   ├── index_{model}.index       # FAISS index
-│   ├── index_{model}.pkl         # Paragraph metadata
-│   └── highlighted/              # Highlighted PDFs
+│   ├── index_{model}.index  # FAISS index
+│   ├── index_{model}.pkl    # Paragraph metadata
+│   └── highlighted/         # Highlighted PDFs
 └── tei_cache/
     └── {collection}/
-        └── {hash}.tei.xml        # GROBID output cache
+        └── {hash}.tei.xml   # GROBID output cache
 ```
 
 ## Installation
@@ -69,7 +73,7 @@ curl http://localhost:8070/api/isalive
 ### 3. Run the App
 
 ```bash
-poetry run streamlit run app.py
+poetry run streamlit run zotero_rag/app.py
 ```
 
 Then navigate to `http://localhost:8501`
