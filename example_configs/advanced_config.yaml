@@ -1,0 +1,95 @@
+# Advanced ZoteroRAG Configuration Example
+# Demonstrates advanced features and custom paraphrases
+
+# Zotero settings
+collection_name: "Machine Learning Papers"  # Optional, use specific collection
+output_base_dir: ./ml_papers_output
+
+# Model settings (optional overrides)
+model_name: BAAI/bge-base-en-v1.5
+qa_model: deepset/roberta-base-squad2
+reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+model_device: mps  # Use 'cpu', 'cuda', or null for auto-detect
+
+# Batch sizes (null = auto-detect, or specify e.g. 32, 64, 128)
+encode_batch_size: 32   # For embedding model
+rerank_batch_size: 16   # For cross-encoder reranking
+
+# Index settings
+# Index is automatically named based on collection and model
+rebuild_index: false  # Set to true to force rebuild
+
+# Questions with custom settings and predefined paraphrases
+questions:
+  # Question 1: Use custom paraphrases (no auto-generation)
+  - question: "What are transformers?"
+    paraphrases:
+      - "Explain transformer architecture"
+      - "How do transformers work in NLP?"
+      - "What is the transformer model?"
+    retrieval_threshold: 0.6
+    rerank_threshold: 0.3
+    highlight_color: [1, 1, 0]  # Yellow
+    question_type: explanation
+    custom_config:
+      qa_score_threshold: 0.15
+      max_answer_length: 200
+      min_answer_words: 3
+  
+  # Question 2: Stricter settings for precise answers
+  - question: "What learning rate was used?"
+    num_paraphrases: 1  # Minimal paraphrasing for factoid questions
+    retrieval_threshold: 0.5  # More strict retrieval
+    rerank_threshold: 0.4
+    highlight_color: [1, 0, 1]  # Pink
+    question_type: factoid
+    custom_config:
+      qa_score_threshold: 0.3  # Only high-confidence answers
+      max_answer_length: 50
+      min_answer_words: 2
+      prefer_entities: true
+  
+  # Question 3: Lenient settings for exploratory questions
+  - question: "What are the main challenges in training large models?"
+    num_paraphrases: 3
+    retrieval_threshold: 0.8  # Cast wider net
+    rerank_threshold: 0.2
+    highlight_color: [0, 1, 0]  # Green
+    question_type: methodology
+    custom_config:
+      qa_score_threshold: 0.05  # Accept more answers
+      max_answer_length: 250
+      min_answer_words: 5
+      section_diversity: true
+  
+  # Question 4: With predefined paraphrases + strict filtering
+  - question: "How does BERT differ from GPT?"
+    paraphrases:
+      - "What are the differences between BERT and GPT?"
+      - "Compare BERT and GPT architectures"
+      - "BERT vs GPT: what are the key distinctions?"
+    retrieval_threshold: 0.6
+    rerank_threshold: 0.35
+    highlight_color: [0, 0.5, 1]  # Blue
+    question_type: comparison
+    custom_config:
+      qa_score_threshold: 0.2
+      max_answer_length: 150
+      prefer_diversity: true
+  
+  # Question 5: Using defaults (no overrides)
+  - question: "What datasets were used for evaluation?"
+    highlight_color: [1, 0.5, 0]  # Orange
+
+# Default settings for all questions
+defaults:
+  num_paraphrases: 2
+  retrieval_threshold: 0.7
+  rerank_threshold: 0.25
+  highlight_color: [1, 1, 0]
+  question_type: general
+  custom_config: null
+
+# Output settings
+create_highlighted_pdfs: true  # Generate highlighted PDFs
+output_results_file: ml_papers_results.json  # Save to JSON

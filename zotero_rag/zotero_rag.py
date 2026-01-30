@@ -12,6 +12,7 @@ import nltk
 
 from models import Paragraph, Answer
 from zotero_db import ZoteroDatabase
+from folder_source import FolderPDFSource
 from pdf_processor import PDFProcessor
 from indexer import Indexer
 from reranker import Reranker
@@ -55,6 +56,8 @@ class ZoteroRAG:
     def __init__(self, 
                  zotero_data_dir: str = None, 
                  collection_name: str = None,
+                 source_type: str = 'zotero',
+                 folder_path: str = None,
                  model_name: str = "BAAI/bge-base-en-v1.5", 
                  qa_model: str = "deepset/roberta-base-squad2",
                  reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
@@ -65,11 +68,13 @@ class ZoteroRAG:
                  rerank_batch_size: int = None,
                  tei_cache_dir: str = None,
                  output_base_dir: str = "output"):
-        """Initialize the Zotero RAG system.
+        """Initialize the RAG system.
         
         Args:
-            zotero_data_dir: Path to Zotero data directory. Auto-detect if None.
-            collection_name: Name of Zotero collection to use. If None, use entire library.
+            zotero_data_dir: Path to Zotero data directory. Auto-detect if None (for Zotero mode).
+            collection_name: Name of Zotero collection to use. If None, use entire library (for Zotero mode).
+            source_type: Type of PDF source - 'zotero' or 'folder'.
+            folder_path: Path to folder containing PDFs (for folder mode).
             model_name: Name of the sentence transformer model for embeddings.
             qa_model: Name of the QA model for answer extraction.
             reranker_model: Name of the cross-encoder model for reranking.
@@ -81,16 +86,26 @@ class ZoteroRAG:
             tei_cache_dir: Directory to cache TEI XML outputs.
             output_base_dir: Base directory for storing indexes and outputs.
         """
+        self.source_type = source_type
         self.collection_name = collection_name
+        self.folder_path = folder_path
         self.output_base_dir = output_base_dir
         
-        # Initialize components
-        self.db = ZoteroDatabase(zotero_data_dir)
+        # Initialize the appropriate source
+        if source_type == 'folder':
+            if not folder_path:
+                raise ValueError("folder_path is required when source_type='folder'")
+            self.source = FolderPDFSource(folder_path)
+            # Use folder name for cache directory
+            source_name = os.path.basename(folder_path)
+        else:
+            self.source = ZoteroDatabase(zotero_data_dir)
+            source_name = collection_name
         
         # Set up TEI cache directory
         base_cache = tei_cache_dir or os.path.join(output_base_dir, "tei_cache")
-        coll_folder = self._sanitize_filename(collection_name)
-        pdf_cache_dir = os.path.join(base_cache, coll_folder)
+        source_folder = self._sanitize_filename(source_name)
+        pdf_cache_dir = os.path.join(base_cache, source_folder)
         
         self.pdf_processor = PDFProcessor(
             grobid_url=grobid_url,
@@ -117,8 +132,8 @@ class ZoteroRAG:
         
         self.highlighter = PDFHighlighter()
         
-        # Set index paths based on collection
-        self.indexer.set_index_paths(collection_name, output_base_dir)
+        # Set index paths based on source
+        self.indexer.set_index_paths(source_name, output_base_dir)
         
         # Color management for multi-query highlighting
         self.query_colors = [
@@ -221,10 +236,11 @@ class ZoteroRAG:
                 progress_callback('pdf', 1, 1, "Loading existing index...")
             return self.indexer.load_index()
         
-        # Get items from Zotero
-        items = self.db.get_items(self.collection_name)
+        # Get items from source (Zotero or folder)
+        items = self.source.get_items(self.collection_name)
         if not items:
-            raise ValueError("No PDF items found in the specified Zotero collection/library.")
+            source_desc = f"folder {self.folder_path}" if self.source_type == 'folder' else "Zotero collection/library"
+            raise ValueError(f"No PDF items found in the specified {source_desc}.")
         
         # Stage 1: Process PDFs and extract paragraphs
         all_paragraphs = []

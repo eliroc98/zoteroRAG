@@ -1,0 +1,122 @@
+# ZoteroRAG Configuration File Example
+# This file demonstrates all available configuration options
+
+# ============================================================================
+# Zotero and Output Settings
+# ============================================================================
+
+# Path to Zotero data directory (optional - auto-detect if not provided)
+# Example: /Users/username/Zotero
+zotero_data_dir: null
+
+# Name of Zotero collection to use (optional - use entire library if not provided)
+# Example: "Machine Learning Papers"
+collection_name: null
+
+# Base directory for all outputs (indexes, TEI cache, highlighted PDFs)
+output_base_dir: ./output
+
+# ============================================================================
+# Model Settings
+# ============================================================================
+
+# Embedding model for semantic search
+model_name: BAAI/bge-base-en-v1.5
+
+# Question answering model for extractive QA
+qa_model: deepset/roberta-base-squad2
+
+# Cross-encoder model for reranking
+reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+
+# Device to use: 'cpu', 'cuda', 'mps', or null for auto-detect
+model_device: null
+
+# Batch size for encoding embeddings (null = auto-detect for 75% memory)
+encode_batch_size: null
+
+# Batch size for reranking (null = auto-detect for 75% memory)
+rerank_batch_size: null
+
+# ============================================================================
+# GROBID Settings (for PDF processing)
+# ============================================================================
+
+grobid_url: http://localhost:8070
+grobid_timeout: 180
+
+# ============================================================================
+# Index Settings
+# ============================================================================
+
+# Force rebuild index even if it exists
+# Index is automatically named based on collection and model
+rebuild_index: false
+
+# ============================================================================
+# Default Settings for All Questions
+# ============================================================================
+
+defaults:
+  # Number of question paraphrases to auto-generate (0 = disabled)
+  num_paraphrases: 2
+  
+  # L2 distance threshold for initial retrieval (lower = more similar)
+  retrieval_threshold: 0.7
+  
+  # Minimum QA confidence score to keep answers (0-1)
+  qa_score_threshold: 0.1
+  
+  # Minimum rerank probability to keep candidates (0-1)
+  rerank_threshold: 0.25
+  
+  # Default highlight color as RGB values (0-1)
+  # Yellow: [1, 1, 0], Green: [0, 1, 0], Blue: [0, 0.5, 1], Pink: [1, 0, 1]
+  highlight_color: [1, 1, 0]
+
+# ============================================================================
+# Questions to Answer
+# ============================================================================
+
+questions:
+  # Example 1: Simple question with defaults
+  - question: "What are transformers?"
+  
+  # Example 2: Question with custom pipeline settings
+  - question: "How does attention mechanism work?"
+    retrieval_threshold: 0.6
+    rerank_threshold: 0.3
+    num_paraphrases: 3
+    highlight_color: [0, 1, 0]  # Green
+    question_type: methodology
+  
+  # Example 3: Question with pre-defined paraphrases
+  - question: "What is BERT?"
+    paraphrases:
+      - "Explain BERT architecture"
+      - "How does BERT work?"
+      - "What are the key features of BERT?"
+    highlight_color: [0, 0.5, 1]  # Blue
+  
+  # Example 4: Question with custom QA config
+  - question: "What is the learning rate used?"
+    retrieval_threshold: 0.5
+    rerank_threshold: 0.4
+    num_paraphrases: 1
+    highlight_color: [1, 0, 1]  # Pink
+    question_type: factoid
+    custom_config:
+      qa_score_threshold: 0.3
+      max_answer_length: 50
+      min_answer_words: 2
+      prefer_entities: true
+
+# ============================================================================
+# Output Settings
+# ============================================================================
+
+# Create highlighted PDFs with answers marked
+create_highlighted_pdfs: true
+
+# Save results to JSON file (optional - set to null to disable)
+output_results_file: results.json

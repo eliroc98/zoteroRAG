@@ -1,11 +1,12 @@
 # 📚 Zotero RAG Navigator
 
-A question-answering system for your local Zotero library featuring a multi-stage RAG pipeline with GROBID parsing, semantic search, reranking, and extractive QA. Generate precise answers from your research papers with automatic highlighting and question expansion.
+A question-answering system for your local Zotero library or PDF folders featuring a multi-stage RAG pipeline with GROBID parsing, semantic search, reranking, and extractive QA. Generate precise answers from your research papers with automatic highlighting and question expansion.
 
 ## Features
 
 **3-Stage RAG Pipeline**: FAISS retrieval → CrossEncoder reranking → Extractive QA
 
+- **Flexible PDF sources**: Zotero collections or any folder of PDFs
 - GROBID sentence-level parsing with coordinates for precise PDF highlighting
 - Question expansion via automatic paraphrasing for improved recall
 - Question type presets (factoid, methodology, explanation, comparison)
@@ -16,7 +17,7 @@ A question-answering system for your local Zotero library featuring a multi-stag
 ## Requirements
 
 - Python 3.11+
-- Zotero (with local PDF storage)
+- Zotero (with local PDF storage) **OR** a folder containing PDF files
 - GROBID server (Docker)
 - PyTorch with MPS/CUDA support (optional, CPU works too)
 
@@ -26,8 +27,10 @@ A question-answering system for your local Zotero library featuring a multi-stag
 .
 ├── zotero_rag/              # Main package
 │   ├── app.py               # Streamlit web interface
+│   ├── run_from_config.py   # Programmatic YAML config runner
 │   ├── zotero_rag.py        # Main orchestration class
 │   ├── zotero_db.py         # Zotero SQLite database interface
+│   ├── folder_source.py     # Folder-based PDF source
 │   ├── pdf_processor.py     # GROBID client and TEI parsing
 │   ├── indexer.py           # FAISS indexing and retrieval
 │   ├── reranker.py          # CrossEncoder reranking
@@ -35,10 +38,16 @@ A question-answering system for your local Zotero library featuring a multi-stag
 │   ├── highlighter.py       # PDF annotation using coordinates
 │   └── models.py            # Data classes (Paragraph, Answer)
 │
+├── example_configs/              # Example YAML configurations
+│   ├── example_config.yaml       # Full YAML config with documentation
+│   ├── advanced_config.yaml      # Advanced YAML config with custom paraphrases
+│   ├── folder_example_config.yaml # Example config for folder-based PDFs
+│   ├── question_type_presets.yaml # Question type preset documentation
+│   └── highlighter_colors.html   # Color reference for highlighting
+│
 ├── pyproject.toml           # Poetry dependencies
 ├── README.md                # This file
-├── LICENSE                  # GPL v3.0 license
-└── test_new_features.py     # Feature tests
+└── LICENSE                  # GPL v3.0 license
 
 output/                     # Output directory (indexes, cache, highlighted PDFs)
 ├── {collection}/
@@ -56,6 +65,7 @@ output/                     # Output directory (indexes, cache, highlighted PDFs
 
 ```bash
 git clone https://github.com/eliroc98/zoteroRAG.git
+cd zoteroRAG
 poetry install
 ```
 
@@ -86,13 +96,20 @@ Then navigate to `http://localhost:8501`
    - Specify where to store indexes, TEI cache, and highlighted PDFs
    - Default: `./literature_output`
 
-2. **GROBID Configuration**
+2. **Select PDF Source**
+   - **📚 Zotero Collection**: Use PDFs from your Zotero library
+   - **📁 Folder of PDFs**: Use PDFs from any folder on your system
+   
+   **For Zotero**: Choose a collection or "All Library"
+   
+   **For Folder**: Enter the full path to a folder containing PDFs (will search recursively)
+   - Example: `/Users/username/Documents/research_papers`
+   - All PDFs in the folder and subfolders will be indexed
+
+3. **GROBID Configuration**
    - Service URL (default: `http://localhost:8070`)
    - Leave default if running locally
    - Required for new PDFs; cached TEI files are reused
-
-3. **Select Collection**
-   - Choose a Zotero collection or "All Library"
 
 4. **Select Embedding Model**
    - Model name: Any HuggingFace SentenceTransformer (e.g., `BAAI/bge-base-en-v1.5`)
@@ -152,9 +169,9 @@ Then navigate to `http://localhost:8501`
 ### Data Flow
 
 ```
-Zotero Library
+PDF Source (Zotero Library OR Folder)
     ↓
-PDF Selection (by collection)
+PDF Selection
     ↓
 GROBID Processing (sentence segmentation + coordinates)
     ↓
@@ -215,6 +232,82 @@ Each question type has optimized parameters:
 
 ### Programmatic Usage
 
+#### Option 1: YAML Configuration (Recommended)
+
+Create a YAML config file (see [example_configs/example_config.yaml](example_configs/example_config.yaml) for full documentation):
+
+```yaml
+# config.yaml
+collection_name: "My Research Papers"
+output_base_dir: ./output
+
+# Model settings (optional - uses defaults if not specified)
+model_name: BAAI/bge-base-en-v1.5
+qa_model: deepset/roberta-base-squad2
+reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+model_device: null  # null for auto-detect, or 'cpu', 'cuda', 'mps'
+
+# Batch sizes (null for auto-detect)
+encode_batch_size: null
+rerank_batch_size: null
+
+# Questions to answer
+questions:
+  - question: "What are transformers?"
+    highlight_color: [1, 1, 0]  # Yellow
+  
+  - question: "How does attention work?"
+    paraphrases:
+      - "Explain the attention mechanism"
+      - "What is the attention layer?"
+    highlight_color: [0, 1, 0]  # Green
+    question_type: explanation
+    
+  - question: "What datasets were used?"
+    retrieval_threshold: 0.5
+    rerank_threshold: 0.3
+    highlight_color: [0, 0.5, 1]  # Blue
+    question_type: factoid
+    custom_config:
+      qa_score_threshold: 0.3
+      max_answer_length: 100
+      prefer_entities: true
+
+# Default settings for all questions
+defaults:
+  num_paraphrases: 2
+  retrieval_threshold: 0.7
+  rerank_threshold: 0.25
+  highlight_color: [1, 1, 0]
+  question_type: general
+
+# Output settings
+create_highlighted_pdfs: true
+output_results_file: results.json
+```
+
+Run from command line:
+```bash
+poetry run python -m zotero_rag.run_from_config config.yaml
+```
+
+Or use programmatically:
+```python
+from zotero_rag.run_from_config import run_from_config
+
+# Run config and get results
+results = run_from_config('config.yaml')
+
+# Results is a dict: {question: [Answer, Answer, ...]}
+for question, answers in results.items():
+    print(f"\nQuestion: {question}")
+    for answer in answers[:3]:
+        print(f"  - {answer.text} (score: {answer.score:.3f})")
+        print(f"    PDF: {answer.pdf_path}, Page: {answer.page_num}")
+```
+
+#### Option 2: Python API
+
 ```python
 from zotero_rag import ZoteroRAG
 
@@ -241,12 +334,11 @@ print(f"Indexed {num_chunks} paragraphs")
 # Ask a question with full pipeline
 answers = rag.answer_question(
     question="How does attention mechanism work?",
-    retrieval_threshold=2.0,     # L2 distance for FAISS
-    rerank_threshold=0.25,       # CrossEncoder score
-    qa_score_threshold=0.0,      # QA confidence
+    retrieval_threshold=0.7,     # L2 distance for FAISS
+    rerank_threshold=0.25,       # CrossEncoder score (0-1)
     question_type='methodology', # Use preset optimization
     num_paraphrases=2,           # Generate question variations
-    highlight_color=(1.0, 1.0, 0.0)  # Yellow highlights
+    highlight_color=(1.0, 1.0, 0.0)  # Yellow highlights (RGB 0-1)
 )
 
 # Display answers
@@ -254,9 +346,9 @@ for answer in answers:
     print(f"\n{'='*80}")
     print(f"PDF: {answer.pdf_path}")
     print(f"Page: {answer.page_num} | Section: {answer.section}")
-    print(f"Score: {answer.score:.3f} | Distance: {answer.distance:.3f}")
+    print(f"Score: {answer.score:.3f} | Rerank: {answer.rerank_score:.3f}")
     print(f"\nContext: {answer.context}")
-    print(f"Answer: {answer.answer}")
+    print(f"Answer: {answer.text}")
 
 # Group answers by PDF and highlight
 from collections import defaultdict
@@ -269,22 +361,69 @@ for pdf_path, pdf_answers in by_pdf.items():
     rag.highlight_pdf(pdf_answers, output_path)
     print(f"Highlighted: {output_path}")
 
-# Advanced: Custom configuration
+# Advanced: Pre-defined question variations (skip auto-generation)
+predefined_paraphrases = [
+    "How does attention mechanism work?",
+    "Explain the attention layer",
+    "What is the attention mechanism?"
+]
+
+answers = rag.answer_question(
+    question="How does attention mechanism work?",
+    question_variations=predefined_paraphrases,
+    highlight_color=(0, 1, 0)  # Green
+)
+
+# Advanced: Custom configuration (overrides question_type presets)
 custom_config = {
-    'qa_score_threshold': 0.1,
-    'max_answer_length': 200,
-    'min_answer_words': 3,
-    'prefer_entities': False,
-    'section_diversity': True,
-    'priority_sections': ['abstract', 'methodology']
+    'qa_score_threshold': 0.1,    # Minimum QA confidence (0-1)
+    'max_answer_length': 200,      # Max characters per answer
+    'min_answer_words': 3,         # Minimum word count filter
+    'prefer_entities': False,      # Prioritize named entities
+    'section_diversity': True,     # Prefer answers from different sections
+    'priority_sections': ['abstract', 'methodology']  # Preferred sections
 }
 
 answers = rag.answer_question(
     question="What datasets were used?",
-    question_type='factoid',
-    custom_config=custom_config
+    question_type='factoid',       # Base preset to start from
+    custom_config=custom_config    # Custom overrides
 )
 ```
+
+## Advanced Features
+
+### Question Type Presets
+
+The system includes optimized presets for different query types (see [example_configs/question_type_presets.yaml](example_configs/question_type_presets.yaml)):
+
+- **factoid**: Short, precise answers ("Who invented transformers?", "What learning rate was used?")
+- **methodology**: Detailed process explanations ("How does attention work?", "How is the model trained?")
+- **explanation**: Conceptual understanding ("Why are transformers effective?", "What makes BERT different?")
+- **comparison**: Contrasting approaches ("What's the difference between BERT and GPT?")
+- **definition**: Clear term explanations ("What is BERT?", "Define attention mechanism")
+- **general**: Balanced settings for mixed queries
+
+Each preset automatically adjusts retrieval thresholds, answer length, and filtering criteria.
+
+### Multi-Color Highlighting
+
+Run multiple queries with different colors to explore different aspects:
+
+```python
+colors = [(1, 1, 0), (0, 1, 0), (1, 0, 1)]  # Yellow, Green, Pink
+questions = [
+    "What are transformers?",
+    "How does attention work?",
+    "What datasets were used?"
+]
+
+for question, color in zip(questions, colors):
+    answers = rag.answer_question(question, highlight_color=color)
+    # Highlights accumulate in the same PDFs
+```
+
+See [example_configs/highlighter_colors.html](example_configs/highlighter_colors.html) for color reference.
 
 ## Citation
 

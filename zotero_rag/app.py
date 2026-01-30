@@ -98,9 +98,13 @@ def main():
         st.session_state.model_loaded = False
     if 'model_device' not in st.session_state:
         st.session_state.model_device = None  # auto-select
+    if 'source_type' not in st.session_state:
+        st.session_state.source_type = 'zotero'
+    if 'folder_path' not in st.session_state:
+        st.session_state.folder_path = ""
     
-    # Load collections on first run
-    if not st.session_state.collections_loaded:
+    # Load collections on first run (only if using Zotero)
+    if not st.session_state.collections_loaded and st.session_state.source_type == 'zotero':
         try:
             with st.spinner("Loading Zotero collections..."):
                 st.session_state.collections = ZoteroRAG.list_collections()
@@ -151,24 +155,65 @@ def show_setup_tab():
     
     st.header("⚙️ Setup Configuration")
     
-    # Collection Selection
-    st.subheader("1️⃣ Select Collection")
-    collection_options = ["All Library"]
-    for coll in st.session_state.collections:
-        name = coll['name']
-        if coll['parent_id']:
-            parent_name = next((c['name'] for c in st.session_state.collections 
-                              if c['id'] == coll['parent_id']), "Unknown")
-            name = f"{parent_name} > {name}"
-        collection_options.append(name)
+    # Source Selection
+    st.subheader("1️⃣ Select PDF Source")
     
-    selected_collection = st.selectbox(
-        "Choose which Zotero collection to search",
-        collection_options,
-        key="collection_selector"
+    source_type = st.radio(
+        "Choose your PDF source:",
+        options=['zotero', 'folder'],
+        format_func=lambda x: "📚 Zotero Collection" if x == 'zotero' else "📁 Folder of PDFs",
+        horizontal=True,
+        key="source_type_selector"
     )
     
-    st.session_state.collection_name = None if selected_collection == "All Library" else selected_collection.split(" > ")[-1].strip()
+    # Update session state
+    if source_type != st.session_state.source_type:
+        st.session_state.source_type = source_type
+        st.session_state.model_loaded = False
+        st.session_state.indexed = False
+        # Load collections if switching to Zotero
+        if source_type == 'zotero' and not st.session_state.collections_loaded:
+            try:
+                with st.spinner("Loading Zotero collections..."):
+                    st.session_state.collections = ZoteroRAG.list_collections()
+                    st.session_state.collections_loaded = True
+            except Exception as e:
+                st.error(f"Error loading Zotero: {e}")
+                st.info("Make sure Zotero is installed and the database is accessible")
+    
+    # Show appropriate source selection UI
+    if st.session_state.source_type == 'zotero':
+        # Collection Selection - only show if collections are loaded
+        if st.session_state.collections_loaded and st.session_state.collections:
+            collection_options = ["All Library"]
+            for coll in st.session_state.collections:
+                name = coll['name']
+                if coll['parent_id']:
+                    parent_name = next((c['name'] for c in st.session_state.collections 
+                                      if c['id'] == coll['parent_id']), "Unknown")
+                    name = f"{parent_name} > {name}"
+                collection_options.append(name)
+            
+            selected_collection = st.selectbox(
+                "Choose which Zotero collection to search",
+                collection_options,
+                key="collection_selector"
+            )
+            
+            st.session_state.collection_name = None if selected_collection == "All Library" else selected_collection.split(" > ")[-1].strip()
+        else:
+            st.warning("⚠️ No collections loaded. Make sure Zotero is installed and accessible.")
+            st.session_state.collection_name = None
+    else:
+        # Folder path selection
+        folder_path = st.text_input(
+            "Enter folder path containing PDFs:",
+            value=st.session_state.folder_path,
+            placeholder="/path/to/pdf/folder",
+            help="Enter the full path to a folder containing PDF files (will search recursively)"
+        )
+        st.session_state.folder_path = folder_path
+        st.session_state.collection_name = None  # Not used for folder mode
     
     st.markdown("---")
     
@@ -240,6 +285,11 @@ def show_setup_tab():
     
     if st.button("📥 Load Model", type="primary", use_container_width=True):
         if model_input:
+            # Validate source configuration
+            if st.session_state.source_type == 'folder' and not st.session_state.folder_path:
+                st.error("Please enter a folder path")
+                return
+            
             with st.spinner(f"Loading model: {model_input}..."):
                 try:
                     st.session_state.model_name = model_input
@@ -247,15 +297,31 @@ def show_setup_tab():
                     st.session_state.model_device = None if device_choice == "auto" else device_choice
                     st.session_state.encode_batch_size = encode_batch_size
                     st.session_state.rerank_batch_size = rerank_batch_size
-                    st.session_state.rag = ZoteroRAG(
-                        collection_name=st.session_state.collection_name,
-                        model_name=model_input,
-                        grobid_url=grobid_url,
-                        output_base_dir=st.session_state.output_dir,
-                        model_device=st.session_state.model_device,
-                        encode_batch_size=encode_batch_size,
-                        rerank_batch_size=rerank_batch_size
-                    )
+                    
+                    # Initialize RAG with appropriate source
+                    if st.session_state.source_type == 'folder':
+                        st.session_state.rag = ZoteroRAG(
+                            source_type='folder',
+                            folder_path=st.session_state.folder_path,
+                            model_name=model_input,
+                            grobid_url=grobid_url,
+                            output_base_dir=st.session_state.output_dir,
+                            model_device=st.session_state.model_device,
+                            encode_batch_size=encode_batch_size,
+                            rerank_batch_size=rerank_batch_size
+                        )
+                    else:
+                        st.session_state.rag = ZoteroRAG(
+                            source_type='zotero',
+                            collection_name=st.session_state.collection_name,
+                            model_name=model_input,
+                            grobid_url=grobid_url,
+                            output_base_dir=st.session_state.output_dir,
+                            model_device=st.session_state.model_device,
+                            encode_batch_size=encode_batch_size,
+                            rerank_batch_size=rerank_batch_size
+                        )
+                    
                     st.session_state.model_loaded = True
                     st.session_state.indexed = False  # Reset indexed status
                     
@@ -287,23 +353,33 @@ def show_setup_tab():
     if st.session_state.model_loaded:
         st.subheader("4️⃣ Build/Load Index")
         
+        # Determine source name for index lookup
+        if st.session_state.source_type == 'folder':
+            source_name = os.path.basename(st.session_state.folder_path) if st.session_state.folder_path else "folder"
+        else:
+            source_name = st.session_state.collection_name
+        
         # Check for existing indexes
         existing_indexes = find_saved_indexes(
-            st.session_state.collection_name,
+            source_name,
             st.session_state.model_name,
             base_dir=st.session_state.output_dir
         )
         
         if existing_indexes and not st.session_state.indexed:
-            st.info(f"Found {len(existing_indexes)} existing index(es) for this collection and model")
+            st.info(f"Found {len(existing_indexes)} existing index(es) for this source and model")
             
             # Auto-load first index
             with st.spinner("Loading existing index..."):
                 try:
-                    coll_name = st.session_state.rag.collection_name
-                    collection_folder_name = _sanitize_filename(coll_name)
+                    # Use source name instead of collection name
+                    if st.session_state.source_type == 'folder':
+                        source_folder_name = _sanitize_filename(os.path.basename(st.session_state.folder_path))
+                    else:
+                        source_folder_name = _sanitize_filename(st.session_state.rag.collection_name)
+                    
                     first_index = existing_indexes[0]
-                    index_base_path = os.path.join(st.session_state.output_dir, collection_folder_name, first_index)
+                    index_base_path = os.path.join(st.session_state.output_dir, source_folder_name, first_index)
                     
                     st.session_state.rag.set_index_paths(index_base_path)
                     num_chunks = st.session_state.rag.load_index()
@@ -395,9 +471,11 @@ def show_setup_tab():
     # Reset button
     if st.button("🔄 Start Over", use_container_width=True):
         collections = st.session_state.get('collections', [])
+        collections_loaded = st.session_state.get('collections_loaded', False)
         st.session_state.clear()
-        st.session_state.collections_loaded = True
+        st.session_state.collections_loaded = collections_loaded
         st.session_state.collections = collections
+        st.session_state.source_type = 'zotero'  # Default to zotero
         st.rerun()
 
 

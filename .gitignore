@@ -209,3 +209,4 @@ literature/__pycache__/
 __pycache__/zotero_rag.cpython-311.pyc
 
 poetry.lock
+.DS_Store

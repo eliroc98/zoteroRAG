@@ -1,0 +1,210 @@
+# Question Type Presets Reference
+# Copy and paste these into your custom_config section for different question types
+# Each preset is optimized for different kinds of queries
+
+# =============================================================================
+# FACTOID - Short, precise answers
+# =============================================================================
+# Use for: "Who invented transformers?", "What year was BERT released?",
+#          "What learning rate was used?", "How many layers does GPT have?"
+#
+# Copy this into your question config:
+question_type: factoid
+retrieval_threshold: 2.0
+rerank_threshold: 0.25
+custom_config:
+  qa_score_threshold: 0.1
+  max_answer_length: 50
+  min_answer_words: 2
+  prefer_entities: true
+
+# =============================================================================
+# METHODOLOGY - Detailed process explanations
+# =============================================================================
+# Use for: "How does attention mechanism work?", "How is the model trained?",
+#          "What is the training procedure?", "How do you implement X?"
+#
+# Copy this into your question config:
+question_type: methodology
+retrieval_threshold: 2.5
+rerank_threshold: 0.20
+custom_config:
+  qa_score_threshold: 0.05
+  max_answer_length: 250
+  min_answer_words: 5
+  prefer_entities: false
+  section_diversity: true
+  priority_sections: 
+    - abstract
+    - introduction
+    - methodology
+    - methods
+    - approach
+    - algorithm
+    - implementation
+
+# =============================================================================
+# EXPLANATION - Conceptual understanding
+# =============================================================================
+# Use for: "Why are transformers effective?", "What makes BERT different?",
+#          "Why does attention work?", "What is the intuition behind X?"
+#
+# Copy this into your question config:
+question_type: explanation
+retrieval_threshold: 2.5
+rerank_threshold: 0.20
+custom_config:
+  qa_score_threshold: 0.05
+  max_answer_length: 200
+  min_answer_words: 3
+  prefer_entities: false
+
+# =============================================================================
+# COMPARISON - Contrasting approaches
+# =============================================================================
+# Use for: "What's the difference between BERT and GPT?",
+#          "How does this compare to previous work?",
+#          "BERT vs GPT architectures", "Compare X and Y"
+#
+# Copy this into your question config:
+question_type: comparison
+retrieval_threshold: 2.0
+rerank_threshold: 0.25
+custom_config:
+  qa_score_threshold: 0.08
+  max_answer_length: 150
+  min_answer_words: 3
+  prefer_diversity: true
+
+# =============================================================================
+# DEFINITION - Clear explanations of terms
+# =============================================================================
+# Use for: "What is BERT?", "Define attention mechanism",
+#          "What are transformers?", "Explain residual connections"
+#
+# Copy this into your question config:
+question_type: definition
+retrieval_threshold: 2.0
+rerank_threshold: 0.25
+custom_config:
+  qa_score_threshold: 0.1
+  max_answer_length: 100
+  min_answer_words: 3
+  prefer_entities: false
+
+# =============================================================================
+# GENERAL - Balanced settings for mixed queries
+# =============================================================================
+# Use for: General questions that don't fit other categories
+#
+# Copy this into your question config:
+question_type: general
+retrieval_threshold: 2.0
+rerank_threshold: 0.25
+custom_config:
+  qa_score_threshold: 0.1
+  max_answer_length: 150
+  min_answer_words: 3
+  prefer_entities: false
+
+# =============================================================================
+# EXAMretrieval_threshold: 2.5
+#     rerank_threshold: 0.20
+#     custom_config:
+#       qa_score_threshold: 0.05
+#       max_answer_length: 250
+#       min_answer_words: 5
+#       prefer_entities: false
+#       section_diversity: true
+#       priority_sections:
+#         - methodology
+#         - methods
+#         - training
+
+# Example 2: Using factoid preset for simple fact extraction
+# questions:
+#   - question: "What learning rate was used?"
+#     retrieval_threshold: 2.0
+#     rerank_threshold: 0.25
+#     custom_config:
+#       qa_score_threshold: 0.1
+#       max_answer_length: 50
+#       min_answer_words: 2
+#       prefer_entities: true
+
+# Example 3: Combining preset with custom overrides
+# questions:
+#   - question: "How does attention work?"
+#     retrieval_threshold: 2.5   # From methodology preset
+#     rerank_threshold: 0.20     # From methodology preset
+#       min_answer_words: 2
+#       prefer_entities: true
+
+# Example 3: Combining preset with custom overrides
+# questions:
+#   - question: "How does attention work?"
+#     custom_config:
+#       qa_score_threshold: 0.05  # From methodology preset
+#       max_answer_length: 300     # Custom: even longer answers
+# retrieval_threshold (0.1-10.0)
+#   - L2 distance threshold for initial FAISS retrieval
+#   - Lower = stricter (fewer, more similar paragraphs)
+#   - Higher = more lenient (more paragraphs retrieved)
+#   - Typical: 1.5-3.0
+#   - Use higher (2.5) for exploratory questions (methodology, explanation)
+#   - Use lower (2.0) for specific questions (factoid, comparison)
+
+# rerank_threshold (0-1)
+#   - Minimum CrossEncoder score to keep candidates
+#   - Lower = more lenient (keep more candidates for QA)
+#   - Higher = stricter (only keep highly relevant)
+#   - Typical: 0.15-0.30
+#   - Use lower (0.20) for broad questions needing context
+#   - Use higher (0.25) for focused questions
+
+#       min_answer_words: 5
+#       prefer_entities: false
+#       priority_sections:         # Custom sections
+#         - methodology
+#         - background
+
+# =============================================================================
+# PARAMETER DESCRIPTIONS
+# =============================================================================
+
+# qa_score_threshold (0-1)
+#   - Minimum QA model confidence score to keep answers
+#   - Lower = more answers (may include less confident)
+#   - Higher = fewer answers (only high confidence)
+#   - Typical: 0.05-0.3
+
+# max_answer_length (characters)
+#   - Maximum length of extracted answer
+#   - Shorter for factoids (50)
+#   - Longer for explanations (200-250)
+#   - Typical: 50-250
+
+# min_answer_words (count)
+#   - Minimum word count to keep answer
+#   - Prevents single-word or empty answers
+#   - Typical: 2-5
+
+# prefer_entities (boolean)
+#   - Prioritize answers containing named entities
+#   - Good for factoid questions
+#   - Set false for conceptual questions
+
+# section_diversity (boolean)
+#   - Prefer answers from different sections
+#   - Good for methodology/explanation
+#   - Provides multiple perspectives
+
+# priority_sections (list)
+#   - Which paper sections to prioritize
+#   - Common: abstract, introduction, methodology, methods, results
+#   - Helps focus search on relevant parts
+
+# prefer_diversity (boolean)
+#   - Prefer answers from different sources/perspectives
+#   - Good for comparison questions
+#   - Reduces redundant answers

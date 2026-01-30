@@ -1,0 +1,51 @@
+# Example configuration for using a folder of PDFs instead of Zotero collection
+
+# Source configuration - use 'folder' mode instead of 'zotero'
+source_type: folder
+folder_path: /path/to/your/pdf/folder  # Replace with your actual folder path
+
+# Output directory for indexes and highlighted PDFs
+output_base_dir: ./output
+
+# Model configuration
+model_name: BAAI/bge-base-en-v1.5
+qa_model: deepset/roberta-base-squad2
+reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+
+# GROBID service for PDF parsing
+grobid_url: http://localhost:8070
+grobid_timeout: 180
+
+# Optional: specify device and batch sizes
+# model_device: mps  # or 'cpu', 'cuda'
+# encode_batch_size: 8
+# rerank_batch_size: 8
+
+# Whether to rebuild the index even if it already exists
+rebuild_index: false
+
+# Whether to create highlighted PDFs with answers
+create_highlighted_pdfs: true
+
+# Default settings for all questions (can be overridden per question)
+defaults:
+  num_paraphrases: 2
+  retrieval_threshold: 2.0
+  rerank_threshold: 0.25
+  highlight_color: [1, 1, 0]  # RGB color (yellow)
+  question_type: general
+
+# Questions to answer
+questions:
+  - question: "What is the main contribution of this work?"
+    num_paraphrases: 2
+    question_type: general
+    highlight_color: [1, 1, 0]  # yellow
+  
+  - question: "What methodology was used?"
+    question_type: methodology
+    highlight_color: [0, 1, 1]  # cyan
+  
+  - question: "What are the key results?"
+    question_type: factoid
+    highlight_color: [1, 0.5, 0]  # orange
