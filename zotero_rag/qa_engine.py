@@ -2,6 +2,7 @@
 
 import logging
 from typing import List, Tuple, Optional
+import math
 import torch
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering, pipeline
 
@@ -376,16 +377,13 @@ class QAEngine:
                        question_type: str = 'general',
                        custom_config: dict = None) -> List[Answer]:
         """Extract answers from candidate paragraphs using QA model (Batched & Logged)."""
-        if not self.model:
+        if self.model is None:
             raise RuntimeError("QA model not loaded.")
         
         if not candidates:
             logger.info("No candidates provided for QA extraction.")
             return []
         
-        # Imports needed for math operations inside the method
-        import math
-
         # --- 0. INITIALIZE STATS & CONFIG ---
         questions_to_use = question_variations if question_variations else [question]
         config = self.get_config_for_type(question_type, qa_score_threshold)
