@@ -111,6 +111,7 @@ def run_from_config(config_path: str) -> Dict[str, List[Answer]]:
             model_device=config.get('model_device'),
             encode_batch_size=config.get('encode_batch_size'),
             rerank_batch_size=config.get('rerank_batch_size'),
+            qa_batch_size=config.get('qa_batch_size'),
             output_base_dir=config['output_base_dir']
         )
     else:
@@ -126,6 +127,7 @@ def run_from_config(config_path: str) -> Dict[str, List[Answer]]:
             model_device=config.get('model_device'),
             encode_batch_size=config.get('encode_batch_size'),
             rerank_batch_size=config.get('rerank_batch_size'),
+            qa_batch_size=config.get('qa_batch_size'),
             output_base_dir=config['output_base_dir']
         )
     

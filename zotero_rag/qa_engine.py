@@ -2,8 +2,8 @@
 
 import logging
 from typing import List, Tuple, Optional
-from transformers import pipeline
-import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForQuestionAnswering, pipeline
 
 from models import Paragraph, Answer
 
@@ -15,7 +15,8 @@ class QAEngine:
     
     def __init__(self, model_name: str = "deepset/roberta-base-squad2", 
                  device: str = None,
-                 enable_question_expansion: bool = True):
+                 enable_question_expansion: bool = True,
+                 batch_size: int = 128):
         """Initialize the QA engine.
         
         Args:
@@ -23,15 +24,42 @@ class QAEngine:
             device: Device to use ('cpu', 'cuda', 'mps'). Auto-detect if None.
             enable_question_expansion: Generate question variations to improve retrieval.
         """
-        import torch
         self.model_name = model_name
         self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
         self.enable_question_expansion = enable_question_expansion
         self.pipeline = None
+        self.model = None
+        self.tokenizer = None
         self.paraphraser = None
-        self._load_pipeline()
+        self.batch_size = batch_size  # Adjust based on available VRAM
+        
+        self._load_model_direct()
         if enable_question_expansion:
             self._load_paraphraser()
+            
+    def _load_model_direct(self):
+        """Load model and tokenizer directly for manual batching."""
+        try:
+            logger.info(f"Loading QA Model: {self.model_name}...")
+            
+            # Load Tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
+            
+            # Load Model in BFloat16 (Crucial for H100 speed)
+            self.model = AutoModelForQuestionAnswering.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32
+            ).to(self.device)
+            
+            try:
+                self.model = torch.compile(self.model)
+            except:
+                pass
+
+            logger.info(f"QA Model loaded on {self.device}")
+        except Exception as e:
+            logger.error(f"Could not load QA model {self.model_name}: {e}")
+            raise e
     
     def _load_pipeline(self):
         """Load the QA pipeline."""
@@ -51,16 +79,17 @@ class QAEngine:
     def _load_paraphraser(self):
         """Load paraphrasing model for question expansion."""
         try:
-            # Use a lightweight paraphrasing model
-            # Force CPU for stability on MPS
+            # Detect device: 0 for CUDA, -1 for CPU
+            device_id = 0 if self.device == "cuda" else -1
+            
             self.paraphraser = pipeline(
                 "text2text-generation",
                 model="humarin/chatgpt_paraphraser_on_T5_base",
-                device=-1  # Always use CPU (more stable across platforms)
+                device=device_id
             )
-            logger.info("Question paraphraser loaded: humarin/chatgpt_paraphraser_on_T5_base (CPU)")
+            logger.info(f"Question paraphraser loaded on {self.device}")
         except Exception as e:
-            logger.warning(f"Could not load paraphraser: {e}. Question expansion disabled.")
+            logger.warning(f"Could not load paraphraser: {e}")
             self.paraphraser = None
     
     def get_config_for_type(self, question_type: str, base_threshold: float) -> dict:
@@ -346,131 +375,192 @@ class QAEngine:
                        question_variations: List[str] = None,
                        question_type: str = 'general',
                        custom_config: dict = None) -> List[Answer]:
-        """Extract answers from candidate paragraphs using QA model.
-        
-        Args:
-            question: The question to answer.
-            candidates: List of (Paragraph, retrieval_score, original_index, rerank_score) tuples.
-            all_paragraphs: Full list of all paragraphs (for context overlap).
-            qa_score_threshold: Minimum QA confidence score threshold.
-            color: RGB color tuple for highlighting.
-            progress_callback: Function(current, total, message) for progress updates.
-            question_variations: List of question paraphrases to average scores over.
-            question_type: The type of question (factoid, explanation, etc.).
-            custom_config: Custom configuration dict to override preset config.
-            
-        Returns:
-            List of Answer objects, deduplicated and sorted by score.
-        """
-        if not self.pipeline:
-            raise RuntimeError("QA pipeline not available; cannot answer question")
+        """Extract answers from candidate paragraphs using QA model (Batched & Logged)."""
+        if not self.model:
+            raise RuntimeError("QA model not loaded.")
         
         if not candidates:
+            logger.info("No candidates provided for QA extraction.")
             return []
         
-        # Use question variations if provided, otherwise just use the original question
+        # Imports needed for math operations inside the method
+        import math
+
+        # --- 0. INITIALIZE STATS & CONFIG ---
         questions_to_use = question_variations if question_variations else [question]
-        
-        # Get configuration for the specified question type
         config = self.get_config_for_type(question_type, qa_score_threshold)
-        
-        # Override with custom config if provided
         if custom_config:
             config.update(custom_config)
         
-        logger.info(f"Question type: {question_type}, QA threshold: {config['qa_score_threshold']:.3f}")
+        logger.info(f"QA Configuration -> Type: {question_type} | Threshold: {config['qa_score_threshold']:.3f} | Min Words: {config['min_answer_words']}")
         
-        answers = []
-        context_stats = {'expanded': 0, 'not_expanded': 0, 'added_prev': 0, 'added_next': 0}
-        filter_stats = {'total_processed': 0, 'too_few_words': 0, 'below_threshold': 0, 'added': 0}
-        
-        total_operations = len(candidates) * len(questions_to_use)
-        completed_operations = 0
+        # Initialize tracking dictionaries
+        context_stats = {
+            'expanded': 0, 'added_prev': 0, 'added_next': 0, 'not_expanded': 0
+        }
+        filter_stats = {
+            'total_inputs': 0,      # Total (candidates * variations)
+            'successful_raw': 0,    # Raw answers extracted from model
+            'too_few_words': 0,     # Filtered: Answer too short
+            'below_threshold': 0,   # Filtered: Confidence too low
+            'duplicates': 0,        # Filtered: Duplicate content
+            'final_count': 0        # Final answers returned
+        }
+
+        # --- 1. PREPARE BATCH DATA ---
+        batch_questions = []
+        batch_contexts = []
+        metadata_map = [] 
         
         for i, (paragraph, retrieval_score, original_idx, rerank_score) in enumerate(candidates):
-            filter_stats['total_processed'] += 1
-            
-            # Get adaptive context based on question type
+            # Get adaptive context
             combined_text, shift_offset, context_info = self.get_adaptive_context(
                 paragraph, original_idx, all_paragraphs, question_type
             )
             
-            # Track context expansion statistics
+            # Log Context Stats
             if context_info['expanded']:
                 context_stats['expanded'] += 1
-                if context_info['added_prev']:
-                    context_stats['added_prev'] += 1
-                if context_info['added_next']:
-                    context_stats['added_next'] += 1
+                if context_info['added_prev']: context_stats['added_prev'] += 1
+                if context_info['added_next']: context_stats['added_next'] += 1
             else:
                 context_stats['not_expanded'] += 1
             
-            # Run QA model with each question variation and average scores
-            all_results = []
-            for var_idx, q_var in enumerate(questions_to_use):
-                qa_input = {'question': q_var, 'context': combined_text}
-                var_result = self.pipeline(**qa_input)
-                if var_result:
-                    all_results.append(var_result)
+            # Prepare variations
+            for q_var in questions_to_use:
+                batch_questions.append(q_var)
+                batch_contexts.append(combined_text)
+                metadata_map.append({
+                    'paragraph': paragraph,
+                    'retrieval_score': retrieval_score,
+                    'rerank_score': rerank_score,
+                    'shift_offset': shift_offset,
+                    'original_idx': original_idx,
+                    'q_var': q_var,
+                    'context_text': combined_text,
+                    'candidate_idx': i
+                })
+        
+        filter_stats['total_inputs'] = len(batch_questions)
+        logger.info(f"Preparing inference for {len(candidates)} candidates x {len(questions_to_use)} variations = {len(batch_questions)} total sequences.")
+
+        # --- 2. BATCH TOKENIZATION & INFERENCE ---
+        BATCH_SIZE = self.batch_size
+        all_answers_raw = []
+        num_batches = (len(batch_questions) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        for b in range(num_batches):
+            if progress_callback:
+                progress_callback(b, num_batches, f"Running Inference Batch {b+1}/{num_batches}")
                 
-                completed_operations += 1
+            start_idx = b * BATCH_SIZE
+            end_idx = start_idx + BATCH_SIZE
+            
+            b_q = batch_questions[start_idx:end_idx]
+            b_c = batch_contexts[start_idx:end_idx]
+            
+            try:
+                inputs = self.tokenizer(
+                    b_q, b_c,
+                    add_special_tokens=True, return_tensors="pt", padding=True, 
+                    truncation="only_second", max_length=512, return_offsets_mapping=True
+                ).to(self.device)
                 
-                # Update progress with paraphrase info
-                if progress_callback:
-                    variation_info = f"Paraphrase {var_idx + 1}/{len(questions_to_use)}" if len(questions_to_use) > 1 else ""
-                    para_info = f"Paragraph {i+1}/{len(candidates)}"
-                    message = f"{variation_info} - {para_info}" if variation_info else para_info
-                    progress_callback(completed_operations, total_operations, message)
-            
-            
-            # Use max score across variations, with the answer from the highest scoring variation
-            best_result = max(all_results, key=lambda r: r.get('score', 0.0))
-            max_score = best_result.get('score', 0.0)
-            result = best_result.copy()
-            result['score'] = max_score
-            
-            if len(questions_to_use) > 1:
-                logger.debug(f"Using max QA score across {len(questions_to_use)} variations: {max_score:.3f}")
-            
-            # Filter based on question-type-specific minimum words
-            answer_word_count = len(result['answer'].split())
-            if answer_word_count < config['min_answer_words']:
-                logger.debug(f"Filtered answer (too few words: {answer_word_count} < {config['min_answer_words']}): '{result['answer'][:50]}...'")
-                filter_stats['too_few_words'] += 1
+                offset_mapping = inputs.pop("offset_mapping").cpu().numpy()
+                
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                
+                start_logits = outputs.start_logits.cpu().numpy()
+                end_logits = outputs.end_logits.cpu().numpy()
+                
+                # Extract spans from logits
+                for k, (start_logit, end_logit, offsets) in enumerate(zip(start_logits, end_logits, offset_mapping)):
+                    global_idx = start_idx + k
+                    
+                    start_token = start_logit.argmax()
+                    end_token = end_logit.argmax()
+                    
+                    if start_token >= len(offsets) or end_token >= len(offsets) or end_token < start_token:
+                        continue
+                        
+                    start_char_idx = offsets[start_token][0]
+                    end_char_idx = offsets[end_token][1]
+                    
+                    if start_char_idx == 0 and end_char_idx == 0:
+                        continue
+
+                    meta = metadata_map[global_idx]
+                    ans_text = meta['context_text'][start_char_idx:end_char_idx]
+                    raw_score = (start_logit[start_token] + end_logit[end_token]) / 2.0
+                    
+                    # Sigmoid normalization
+                    try:
+                        score_norm = 1 / (1 + math.exp(-raw_score))
+                    except OverflowError:
+                        score_norm = 1.0 if raw_score > 0 else 0.0
+
+                    all_answers_raw.append({
+                        'text': ans_text,
+                        'start': start_char_idx,
+                        'end': end_char_idx,
+                        'score': score_norm,
+                        'meta': meta
+                    })
+                    filter_stats['successful_raw'] += 1
+
+            except Exception as e:
+                logger.error(f"Batch {b} failed: {e}")
                 continue
+
+        # --- 3. RECONSTRUCT & FILTER (WORD COUNT) ---
+        grouped_results = {}
+        for res in all_answers_raw:
+            c_idx = res['meta']['candidate_idx']
+            if c_idx not in grouped_results: grouped_results[c_idx] = []
+            grouped_results[c_idx].append(res)
             
-            raw_answer = result['answer']
-            raw_start = result.get('start', 0)
-            raw_end = result.get('end', len(raw_answer))
+        answers = []
+        for c_idx, group in grouped_results.items():
+            # Pick best variation score
+            best_res = max(group, key=lambda x: x['score'])
             
-            # Determine which paragraph the answer belongs to
-            # If shift_offset > 0, we have prepended context from previous paragraph(s)
+            # Filter: Word Count
+            if len(best_res['text'].split()) < config['min_answer_words']:
+                filter_stats['too_few_words'] += 1
+                logger.debug(f"Rejected (Too Short): {best_res['text'][:30]}...")
+                continue
+                
+            meta = best_res['meta']
+            
+            # Recalculate offsets relative to original paragraph
+            paragraph = meta['paragraph']
+            shift_offset = meta['shift_offset']
+            raw_start, raw_end = best_res['start'], best_res['end']
+            
             target_paragraph = paragraph
-            local_start = raw_start
-            local_end = raw_end
+            local_start, local_end = raw_start, raw_end
             
+            # Handle shifted context logic
             if shift_offset > 0:
                 if raw_end <= shift_offset:
-                    # Answer is entirely in previous context - try to find source paragraph
-                    if original_idx > 0:
-                        prev = all_paragraphs[original_idx - 1]
+                    if meta['original_idx'] > 0:
+                        prev = all_paragraphs[meta['original_idx'] - 1]
                         if prev.pdf_path == paragraph.pdf_path:
                             target_paragraph = prev
                 elif raw_start >= shift_offset:
-                    # Answer is entirely in current paragraph
                     local_start = raw_start - shift_offset
                     local_end = raw_end - shift_offset
                 else:
-                    # Answer spans contexts; use current paragraph
                     local_start = max(0, raw_start - shift_offset)
                     local_end = raw_end - shift_offset
 
-            # Expand to sentence boundaries
+            # Sentence expansion
             expanded_text, new_start, new_end, sentence_coords = self._expand_to_sentences(
                 target_paragraph, local_start, local_end
             )
             
-            answer = Answer(
+            answers.append(Answer(
                 text=expanded_text,
                 context=target_paragraph.text,
                 pdf_path=target_paragraph.pdf_path,
@@ -480,108 +570,90 @@ class QAEngine:
                 section=target_paragraph.section,
                 start_char=new_start,
                 end_char=new_end,
-                score=float(result.get('score', 0.0)),
-                query=question,
+                score=best_res['score'],
+                query=meta['q_var'],
                 color=color,
                 sentence_coords=sentence_coords,
-                retrieval_score=retrieval_score,
-                rerank_score=rerank_score
-            )
-            filter_stats['added'] += 1
-            answers.append(answer)
-        
-        if progress_callback:
-            progress_callback(len(candidates), len(candidates), "Finalizing results...")
-        
-        # Sort by QA score descending
+                retrieval_score=meta['retrieval_score'],
+                rerank_score=meta['rerank_score']
+            ))
+
+        # Sort by score descending
         answers.sort(key=lambda x: x.score, reverse=True)
         
-        # --- DEDUPLICATION ---
+        # --- 4. DEDUPLICATION & THRESHOLDING ---
         unique_answers = []
         
+        # Helper for stats counting within deduplication
+        def is_valid_score(ans):
+            if ans.score < config['qa_score_threshold']:
+                filter_stats['below_threshold'] += 1
+                return False
+            return True
+
         if config.get('section_diversity', False):
-            # For methodology questions: ensure section diversity
-            # Group answers by section type (intro/abstract vs detailed methodology)
+            # ... [Section Diversity Logic] ...
             intro_sections = ['abstract', 'introduction', 'intro']
-            method_sections = ['methodology', 'methods', 'approach', 'algorithm', 
-                             'implementation', 'procedure', 'technique']
+            method_sections = ['methodology', 'methods', 'approach', 'algorithm', 'implementation']
             
-            intro_answers = []
-            method_answers = []
-            other_answers = []
+            intro_answers, method_answers, other_answers = [], [], []
             
             for ans in answers:
-                if ans.score < config['qa_score_threshold']:
-                    logger.debug(f"Filtered answer (score {ans.score:.3f} < {config['qa_score_threshold']:.3f}): '{ans.text[:50]}...'")
-                    filter_stats['below_threshold'] += 1
-                    continue
+                if not is_valid_score(ans): continue
                     
-                section_lower = (ans.section or '').lower()
-                
-                # Categorize by section type
-                if any(s in section_lower for s in intro_sections):
-                    intro_answers.append(ans)
-                elif any(s in section_lower for s in method_sections):
-                    method_answers.append(ans)
-                else:
-                    other_answers.append(ans)
+                sec = (ans.section or '').lower()
+                if any(s in sec for s in intro_sections): intro_answers.append(ans)
+                elif any(s in sec for s in method_sections): method_answers.append(ans)
+                else: other_answers.append(ans)
             
-            # Deduplicate within each group
-            def deduplicate_group(group):
-                seen = set()
-                unique = []
-                for ans in group:
-                    norm_text = " ".join(ans.text.lower().split())
-                    signature = (ans.pdf_path, norm_text)
-                    if signature not in seen:
-                        seen.add(signature)
-                        unique.append(ans)
-                return unique
+            def dedup_list(alist):
+                seen, uniq = set(), []
+                for a in alist:
+                    sig = (a.pdf_path, " ".join(a.text.lower().split()))
+                    if sig not in seen:
+                        seen.add(sig)
+                        uniq.append(a)
+                    else:
+                        filter_stats['duplicates'] += 1
+                return uniq
+
+            intro_u = dedup_list(intro_answers)
+            method_u = dedup_list(method_answers)
+            other_u = dedup_list(other_answers)
             
-            intro_unique = deduplicate_group(intro_answers)
-            method_unique = deduplicate_group(method_answers)
-            other_unique = deduplicate_group(other_answers)
-            
-            # Interleave intro and method answers to show both perspectives
-            max_len = max(len(intro_unique), len(method_unique))
+            # Interleave
+            max_len = max(len(intro_u), len(method_u))
             for i in range(max_len):
-                if i < len(intro_unique):
-                    unique_answers.append(intro_unique[i])
-                if i < len(method_unique):
-                    unique_answers.append(method_unique[i])
-            unique_answers.extend(other_unique)
+                if i < len(intro_u): unique_answers.append(intro_u[i])
+                if i < len(method_u): unique_answers.append(method_u[i])
+            unique_answers.extend(other_u)
             
-            logger.info(f"Section diversity: {len(intro_unique)} intro/abstract, "
-                       f"{len(method_unique)} methodology, {len(other_unique)} other")
         else:
-            # Standard deduplication based on (pdf_path, normalized_text)
+            # Standard Deduplication
             seen_answers = set()
-            
             for ans in answers:
-                # Use question-type-specific threshold
-                if ans.score < config['qa_score_threshold']:
-                    logger.debug(f"Filtered answer (score {ans.score:.3f} < {config['qa_score_threshold']:.3f}): '{ans.text[:50]}...'")
-                    filter_stats['below_threshold'] += 1
-                    continue
-                    
-                # Normalize text to catch minor variations
-                norm_text = " ".join(ans.text.lower().split())
-                signature = (ans.pdf_path, norm_text)
+                if not is_valid_score(ans): continue
                 
-                if signature not in seen_answers:
-                    seen_answers.add(signature)
+                sig = (ans.pdf_path, " ".join(ans.text.lower().split()))
+                if sig not in seen_answers:
+                    seen_answers.add(sig)
                     unique_answers.append(ans)
-        
-        # Log comprehensive statistics
-        logger.info(f"Context expansion stats: {context_stats['expanded']} expanded "
-                   f"({context_stats['added_prev']} +prev, {context_stats['added_next']} +next), "
-                   f"{context_stats['not_expanded']} not expanded")
-        logger.info(f"Filter stats: {filter_stats['total_processed']} processed -> "
-                   f"{filter_stats['added']} passed word filter -> "
-                   f"{len(answers)} pre-dedup -> "
-                   f"{len(unique_answers)} final unique answers")
-        if filter_stats['too_few_words'] > 0:
-            logger.info(f"  Filtered out: {filter_stats['too_few_words']} (too few words), "
-                       f"{filter_stats['below_threshold']} (below QA threshold)")
+                else:
+                    filter_stats['duplicates'] += 1
+
+        filter_stats['final_count'] = len(unique_answers)
+
+        # --- 5. FINAL SUMMARY LOG ---
+        logger.info("-" * 60)
+        logger.info(f"QA EXTRACTION SUMMARY ({question_type})")
+        logger.info(f"Input: {len(candidates)} candidates -> {filter_stats['total_inputs']} sequences (expanded)")
+        logger.info(f"Context: {context_stats['expanded']} expanded ({context_stats['added_prev']} prev, {context_stats['added_next']} next)")
+        logger.info(f"Raw Outputs: {filter_stats['successful_raw']} spans found")
+        logger.info(f"Filtering:")
+        logger.info(f"  - Too Short (<{config['min_answer_words']} words): {filter_stats['too_few_words']}")
+        logger.info(f"  - Low Confidence (<{config['qa_score_threshold']:.2f}): {filter_stats['below_threshold']}")
+        logger.info(f"  - Duplicates: {filter_stats['duplicates']}")
+        logger.info(f"Final Results: {filter_stats['final_count']} unique answers")
+        logger.info("-" * 60)
         
         return unique_answers

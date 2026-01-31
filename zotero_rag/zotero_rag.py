@@ -65,6 +65,7 @@ class ZoteroRAG:
                  grobid_timeout: int = 180,
                  model_device: str = None, 
                  encode_batch_size: int = None,
+                 qa_batch_size: int = None,
                  rerank_batch_size: int = None,
                  tei_cache_dir: str = None,
                  output_base_dir: str = "output"):
@@ -127,7 +128,8 @@ class ZoteroRAG:
         
         self.qa_engine = QAEngine(
             model_name=qa_model,
-            device=model_device
+            device=model_device,
+            batch_size=qa_batch_size,
         )
         
         self.highlighter = PDFHighlighter()
